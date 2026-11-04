@@ -7,13 +7,25 @@ const state = {
   category: "All",
   busy: false,
   ocrAvailable: false,
+  pdfaAvailable: false,
+  pdfaSetupMessage: "",
+  structureCount: 0,
   workflowTools: [],
   workflowOptions: {},
   workflowSteps: [{ tool: "compress", options: "{}" }],
 };
 
 const PRESET_STORAGE_KEY = "papertrail-workflow-presets-v1";
+const JOB_HISTORY_STORAGE_KEY = "papertrail-job-history-v1";
+const MAX_JOB_HISTORY = 50;
+const MAX_WATCH_RESULTS = 10;
+const WATCH_FOLDER_TOOLS = new Set([
+  "compress", "deduplicate", "linearize", "repair", "remove-attachments",
+  "remove-hidden", "remove-metadata", "reverse-pages", "validate",
+]);
 let presetStorageError = "";
+let folderWatch = { active: false, results: [] };
+let jobHistoryError = "";
 
 const pdfTool = (title, action, note, extra = {}) => ({
   title,
@@ -140,6 +152,11 @@ const toolDetails = {
   "pdf-to-text": pdfTool("PDF to text", "Extract text", "Text-based PDFs work best. Scanned pages require OCR."),
   "pdf-to-markdown": pdfTool("PDF to Markdown", "Export Markdown", "Extracts page text with Markdown page headings; complex layout is not reconstructed."),
   "accessible-text": pdfTool("Export accessible text", "Export readable text", "Extracts text blocks in top-to-bottom reading order with page headings."),
+  pdfa: pdfTool("Convert to PDF/A-2b", "Convert to PDF/A-2b", "Uses Ghostscript and validates the result with veraPDF; an RGB ICC profile and server setup are required."),
+  "tag-pdf": {
+    ...pdfTool("Add basic structure tags", "Add page-level tags", "Adds one paragraph tag per text page and sets the document language. This is not PDF/UA conformance tagging."),
+  },
+  "reading-order": pdfTool("Set tagged page reading order", "Save reading order", "Reorders basic page-level structure tags for assistive reading; the visible page order does not change."),
   batch: pdfTool("Run a batch of tools", "Run batch", "Runs up to 10 validated PDF-to-PDF steps in order; files are not retained."),
   "workflow-builder": pdfTool("Build a PDF workflow", "Run workflow", "Chain up to 10 supported PDF operations; optional named presets stay in this browser."),
   presets: {
@@ -152,6 +169,31 @@ const toolDetails = {
     limit: "No document upload required",
     note: "Presets contain workflow settings only and are stored in this browser",
     action: "Manage presets",
+    fileType: "INFO",
+  },
+  "watch-folder": {
+    title: "Watch a folder for new PDFs",
+    accept: "",
+    extensions: [],
+    multiple: false,
+    noFile: true,
+    localOnly: true,
+    browserManaged: true,
+    limit: "Choose a folder in this browser",
+    note: "New and changed PDFs in the selected folder are processed while this page stays open",
+    action: "Start watching",
+    fileType: "INFO",
+  },
+  history: {
+    title: "Browse local job history",
+    accept: "",
+    extensions: [],
+    multiple: false,
+    noFile: true,
+    localOnly: true,
+    limit: "No document upload required",
+    note: "History stores file names and job details in this browser only",
+    action: "View history",
     fileType: "INFO",
   },
   sign: {
@@ -610,6 +652,312 @@ function renderPresetManager() {
   });
 }
 
+function loadJobHistory() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(JOB_HISTORY_STORAGE_KEY) || "[]");
+    const valid = Array.isArray(stored) && stored.every((entry) =>
+      entry
+      && typeof entry.id === "string"
+      && typeof entry.toolId === "string"
+      && typeof entry.toolName === "string"
+      && Array.isArray(entry.inputNames)
+      && entry.inputNames.every((name) => typeof name === "string")
+      && typeof entry.outputName === "string"
+      && typeof entry.completedAt === "string"
+      && Number.isFinite(entry.inputBytes)
+      && Number.isFinite(entry.outputBytes)
+    );
+    if (!valid) throw new Error("stored data has an unexpected format");
+    jobHistoryError = "";
+    return stored.slice(0, MAX_JOB_HISTORY);
+  } catch (error) {
+    jobHistoryError = `Local job history could not be read: ${error.message}`;
+    return [];
+  }
+}
+
+function recordJobHistory({ toolId, toolName, inputNames, outputName, inputBytes, outputBytes }) {
+  const entries = loadJobHistory();
+  if (jobHistoryError) return false;
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    toolId,
+    toolName,
+    inputNames: inputNames.slice(0, 10).map((name) => name.slice(0, 256)),
+    outputName: outputName.slice(0, 256),
+    completedAt: new Date().toISOString(),
+    inputBytes,
+    outputBytes,
+  };
+  try {
+    localStorage.setItem(JOB_HISTORY_STORAGE_KEY, JSON.stringify([entry, ...entries].slice(0, MAX_JOB_HISTORY)));
+    return true;
+  } catch (error) {
+    jobHistoryError = `Local job history could not be saved: ${error.message}`;
+    return false;
+  }
+}
+
+function renderJobHistory() {
+  const entries = loadJobHistory();
+  const intro = document.createElement("p");
+  intro.className = "option-callout";
+  intro.textContent = jobHistoryError
+    ? jobHistoryError
+    : "The most recent 50 completed jobs are listed here. Only tool names, file names, timestamps, and sizes are saved; PDF contents and outputs are not.";
+  elements.options.append(intro);
+
+  const clearButton = document.createElement("button");
+  clearButton.type = "button";
+  clearButton.className = "text-button";
+  clearButton.textContent = "Clear local history";
+  clearButton.disabled = entries.length === 0 && !jobHistoryError;
+  clearButton.addEventListener("click", () => {
+    try {
+      localStorage.removeItem(JOB_HISTORY_STORAGE_KEY);
+      jobHistoryError = "";
+      renderOptions();
+      setNotice("Local job history cleared. PDF files were never stored.", "success");
+    } catch (error) {
+      jobHistoryError = `Local job history could not be cleared: ${error.message}`;
+      setNotice(jobHistoryError, "error");
+    }
+  });
+  elements.options.append(clearButton);
+
+  if (entries.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty-search";
+    empty.textContent = jobHistoryError ? "History is unavailable in this browser." : "No completed jobs yet.";
+    elements.options.append(empty);
+    return;
+  }
+
+  const list = document.createElement("ol");
+  list.className = "job-history-list";
+  entries.forEach((entry) => {
+    const row = document.createElement("li");
+    row.className = "job-history-entry";
+    const heading = document.createElement("strong");
+    heading.textContent = entry.toolName;
+    const files = document.createElement("span");
+    files.textContent = `${entry.inputNames.join(", ")} → ${entry.outputName}`;
+    const meta = document.createElement("span");
+    const date = new Date(entry.completedAt);
+    meta.textContent = `${Number.isNaN(date.getTime()) ? "Unknown date" : date.toLocaleString()} · ${formatBytes(entry.inputBytes)} → ${formatBytes(entry.outputBytes)}`;
+    row.append(heading, files, meta);
+    list.append(row);
+  });
+  elements.options.append(list);
+}
+
+function renderFolderWatcher() {
+  const intro = document.createElement("p");
+  intro.className = "option-callout";
+  intro.textContent = "Choose one operation, then select a folder. This browser checks PDFs directly inside that folder every 3 seconds, skips files already there, and processes files that are added or changed while the page is open.";
+  elements.options.append(intro);
+
+  const field = document.createElement("div");
+  field.className = "field";
+  const label = document.createElement("label");
+  label.htmlFor = "watch-operation";
+  label.textContent = "Operation for new PDFs";
+  const select = document.createElement("select");
+  select.id = "watch-operation";
+  select.disabled = folderWatch.active;
+  const operations = state.catalog.filter((tool) => WATCH_FOLDER_TOOLS.has(tool.id) && tool.status === "ready");
+  operations.forEach((tool) => {
+    const option = document.createElement("option");
+    option.value = tool.id;
+    option.textContent = tool.name;
+    select.append(option);
+  });
+  select.value = folderWatch.active ? folderWatch.toolId : "compress";
+  field.append(label, select);
+  elements.options.append(field);
+
+  const controls = document.createElement("div");
+  controls.className = "watch-folder-controls";
+  const start = document.createElement("button");
+  start.type = "button";
+  start.className = "text-button";
+  start.id = "watch-start";
+  start.textContent = "Choose folder and start";
+  start.hidden = folderWatch.active;
+  start.disabled = typeof window.showDirectoryPicker !== "function" || operations.length === 0;
+  start.addEventListener("click", () => startFolderWatch(select.value));
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "text-button";
+  stop.id = "watch-stop";
+  stop.textContent = "Stop watching";
+  stop.hidden = !folderWatch.active;
+  stop.addEventListener("click", () => {
+    stopFolderWatch(false);
+    renderOptions();
+    setNotice("Folder watching stopped. Existing result links remain available until you leave this tool.", "success");
+  });
+  controls.append(start, stop);
+  elements.options.append(controls);
+
+  const status = document.createElement("p");
+  status.className = "watch-folder-status";
+  status.id = "watch-status";
+  status.textContent = typeof window.showDirectoryPicker !== "function"
+    ? "Folder watching requires a browser with the File System Access API and a secure application origin."
+    : folderWatch.active
+      ? `Watching “${folderWatch.handle.name}”. The selected folder is accessible only while this page stays open.`
+      : "No folder is being watched.";
+  elements.options.append(status);
+
+  const results = document.createElement("ol");
+  results.className = "watch-folder-results";
+  results.id = "watch-results";
+  folderWatch.results.forEach((result) => {
+    const row = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = result.url;
+    link.download = result.outputName;
+    link.textContent = `${result.inputName} → ${result.outputName}`;
+    row.append(link);
+    results.append(row);
+  });
+  elements.options.append(results);
+}
+
+async function readWatchedFolder(handle) {
+  const files = new Map();
+  for await (const [name, entry] of handle.entries()) {
+    if (entry.kind !== "file" || !name.toLowerCase().endsWith(".pdf")) continue;
+    const file = await entry.getFile();
+    files.set(name, { file, signature: `${file.size}:${file.lastModified}` });
+  }
+  return files;
+}
+
+async function startFolderWatch(toolId) {
+  if (typeof window.showDirectoryPicker !== "function") {
+    setNotice("This browser does not support folder watching. Use a current Chromium-based browser on a secure origin.", "error");
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({ mode: "read" });
+    const initialFiles = await readWatchedFolder(handle);
+    folderWatch = {
+      active: true,
+      handle,
+      toolId,
+      seen: new Map(Array.from(initialFiles, ([name, item]) => [name, item.signature])),
+      pending: new Map(),
+      timer: null,
+      processing: false,
+      results: [],
+    };
+    folderWatch.timer = window.setInterval(pollWatchedFolder, 3000);
+    renderOptions();
+    setNotice(`Watching “${handle.name}”. Existing PDFs were skipped; new and changed PDFs will use ${state.catalog.find((tool) => tool.id === toolId)?.name || toolId}.`, "success");
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    setNotice(`Could not start folder watching: ${error.message}`, "error");
+  }
+}
+
+function stopFolderWatch(clearResults) {
+  if (folderWatch.timer) window.clearInterval(folderWatch.timer);
+  folderWatch.active = false;
+  folderWatch.timer = null;
+  if (clearResults) {
+    folderWatch.results.forEach((result) => URL.revokeObjectURL(result.url));
+    folderWatch.results = [];
+  }
+}
+
+async function pollWatchedFolder() {
+  if (!folderWatch.active || folderWatch.processing) return;
+  folderWatch.processing = true;
+  try {
+    const currentFiles = await readWatchedFolder(folderWatch.handle);
+    for (const name of folderWatch.seen.keys()) {
+      if (!currentFiles.has(name)) {
+        folderWatch.seen.delete(name);
+        folderWatch.pending.delete(name);
+      }
+    }
+    const changedFiles = [];
+    currentFiles.forEach((item, name) => {
+      if (folderWatch.seen.get(name) !== item.signature) {
+        folderWatch.seen.set(name, item.signature);
+        folderWatch.pending.set(name, { signature: item.signature, stableScans: 1 });
+        return;
+      }
+      const pending = folderWatch.pending.get(name);
+      if (pending && pending.signature === item.signature) {
+        pending.stableScans += 1;
+        if (pending.stableScans >= 2) {
+          changedFiles.push({ name, ...item });
+          folderWatch.pending.delete(name);
+        }
+      }
+    });
+    for (const item of changedFiles) {
+      if (!folderWatch.active) break;
+      await processWatchedPdf(item.name, item.file);
+    }
+  } catch (error) {
+    stopFolderWatch(false);
+    setNotice(`Folder watching stopped because the selected folder is no longer available: ${error.message}`, "error");
+    renderOptions();
+  } finally {
+    folderWatch.processing = false;
+  }
+}
+
+async function processWatchedPdf(inputName, file) {
+  if (file.size > 80 * 1024 * 1024) {
+    setNotice(`${inputName} exceeds the 80 MiB server limit and was skipped.`, "error");
+    return;
+  }
+  const form = new FormData();
+  form.append("files", file, file.name);
+  try {
+    const response = await fetch(`/api/process/${folderWatch.toolId}`, { method: "POST", body: form });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `The task failed with status ${response.status}.`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename="([^"]+)"/i);
+    const outputName = match ? match[1] : "processed-document";
+    const outputBytes = Number(response.headers.get("x-output-bytes") || blob.size);
+    const toolId = folderWatch.toolId;
+    const toolName = state.catalog.find((tool) => tool.id === toolId)?.name || toolId;
+    const saved = recordJobHistory({
+      toolId,
+      toolName,
+      inputNames: [inputName],
+      outputName,
+      inputBytes: file.size,
+      outputBytes,
+    });
+    if (folderWatch.active && state.tool === "watch-folder") {
+      const url = URL.createObjectURL(blob);
+      folderWatch.results.push({ inputName, outputName, url });
+      while (folderWatch.results.length > MAX_WATCH_RESULTS) {
+        URL.revokeObjectURL(folderWatch.results.shift().url);
+      }
+      renderOptions();
+      setNotice(saved
+        ? `${inputName} was processed. Its download link is ready below.`
+        : `${inputName} was processed, but its local history entry could not be saved.`, saved ? "success" : "error");
+    } else if (!saved) {
+      setNotice(`A watched PDF was processed, but its local history entry could not be saved: ${jobHistoryError}`, "error");
+    }
+  } catch (error) {
+    setNotice(`${inputName} could not be processed: ${processingConnectionError(error)} It will not be retried until the file changes or is added again.`, "error");
+  }
+}
+
 function processingConnectionError(error) {
   if (error instanceof TypeError && /fetch/i.test(error.message)) {
     return "Could not connect to the processing server. This build is not deployed to a cloud host yet. Start the server with `python -m app` and open its URL, or deploy the app and API together on the same origin.";
@@ -620,8 +968,10 @@ function processingConnectionError(error) {
 function setTool(tool) {
   if (!toolDetails[tool]) return;
   const previousTool = state.tool;
+  if (previousTool === "watch-folder" && tool !== previousTool) stopFolderWatch(true);
   state.tool = tool;
   state.pageCount = null;
+  state.structureCount = 0;
   state.formFields = [];
   const details = toolDetails[tool];
   elements.runRow.hidden = Boolean(details.localOnly);
@@ -648,22 +998,37 @@ function setTool(tool) {
   elements.fileLimit.textContent = details.limit;
   elements.settingsNote.textContent = details.note;
   const ocrNeedsSetup = ["ocr-text", "ocr-searchable", "ocr-languages"].includes(tool) && !state.ocrAvailable;
+  const pdfaNeedsSetup = tool === "pdfa" && !state.pdfaAvailable;
+  const setupRequired = ocrNeedsSetup || pdfaNeedsSetup;
+  const browserManaged = Boolean(details.browserManaged);
   const statusTag = document.querySelector("#tool-status");
-  statusTag.classList.toggle("needs-setup", ocrNeedsSetup);
+  statusTag.classList.toggle("needs-setup", setupRequired);
   statusTag.classList.toggle("local-only", Boolean(details.localOnly));
-  statusTag.lastChild.textContent = details.localOnly
-    ? "BROWSER ONLY"
-    : ocrNeedsSetup
-      ? "TESSERACT NEEDED"
+  statusTag.lastChild.textContent = browserManaged
+    ? "BROWSER WATCH"
+    : details.localOnly
+      ? "BROWSER ONLY"
+    : pdfaNeedsSetup
+      ? "PDF/A SETUP NEEDED"
+      : ocrNeedsSetup
+        ? "TESSERACT NEEDED"
       : "READY TO RUN";
-  elements.privacyNote.lastChild.textContent = details.localOnly
-    ? "Browser-only preset settings"
+  elements.privacyNote.lastChild.textContent = browserManaged
+    ? "Folder access stays in this browser"
+    : details.localOnly
+      ? "Browser-only settings and history"
     : "Upload to processing server";
-  elements.privacyMessage.textContent = details.localOnly
-    ? "This tool reads and updates workflow settings in this browser only. It does not upload documents or store server job history."
+  elements.privacyMessage.textContent = browserManaged
+    ? "The selected folder is read by this browser only. New or changed PDFs are uploaded to the configured processing server; the app stores job metadata, not documents or outputs."
+    : details.localOnly
+      ? "This tool reads and updates settings or job metadata in this browser only. PDF files and outputs are not stored in history."
     : "Files are uploaded to the configured server and buffered temporarily for the request. This app does not keep a job archive; the server operator may retain infrastructure logs or backups.";
-  elements.introDescription.textContent = details.localOnly
-    ? "Manage saved workflow settings in this browser. Presets never contain your documents or outputs."
+  elements.introDescription.textContent = browserManaged
+    ? "Watch a folder selected in this browser and process new or changed PDFs with one safe, repeatable operation."
+    : tool === "history"
+      ? "Review recent processing activity saved in this browser. History never contains the PDF documents or output files."
+    : details.localOnly
+      ? "Manage saved workflow settings in this browser. Presets never contain your documents or outputs."
     : "Choose a task and upload your files to the configured processing server. Get the finished copy back without managing a complicated PDF suite.";
   elements.introStamp.hidden = Boolean(details.localOnly);
   elements.outputColumn.hidden = Boolean(details.localOnly);
@@ -685,6 +1050,21 @@ function clearOutput() {
 
 function renderOptions() {
   elements.options.replaceChildren();
+  if (state.tool === "pdfa" && !state.pdfaAvailable) {
+    const note = document.createElement("p");
+    note.className = "option-callout";
+    note.textContent = state.pdfaSetupMessage || "PDF/A-2b needs Ghostscript, veraPDF, and a readable RGB ICC profile configured on the processing server.";
+    elements.options.append(note);
+    return;
+  }
+  if (state.tool === "watch-folder") {
+    renderFolderWatcher();
+    return;
+  }
+  if (state.tool === "history") {
+    renderJobHistory();
+    return;
+  }
   if (state.tool === "workflow-builder") {
     renderWorkflowBuilder();
     return;
@@ -756,6 +1136,20 @@ function renderOptions() {
     addField("OCR language", "language", "select", "eng", {
       choices: [["eng", "English"], ["hin", "Hindi"], ["eng+hin", "English + Hindi"]],
       hint: "The matching Tesseract language data must be installed on the processing server.",
+    });
+  } else if (state.tool === "tag-pdf") {
+    addField("Document language", "document_language", "text", "en-US", {
+      placeholder: "en-US",
+      hint: "Use a BCP 47 language tag that matches the document, such as en-US or hi.",
+    });
+  } else if (state.tool === "reading-order") {
+    const count = state.structureCount;
+    addField("Structure order", "structure_order", "text", count ? Array.from({ length: count }, (_, index) => index + 1).join(", ") : "", {
+      placeholder: count ? Array.from({ length: count }, (_, index) => index + 1).join(", ") : "Choose a PDF with basic page-level tags",
+      inputMode: "numeric",
+      hint: count
+        ? `Reorder all ${count} tagged page paragraphs exactly once. This changes assistive reading order, not visible page order.`
+        : "This tool edits page-level tags created by Add basic structure tags; untagged or complex tagged PDFs are not rewritten.",
     });
   } else if (state.tool === "page-labels") {
     addField("Label prefix", "prefix", "text", "", { placeholder: "Appendix " });
@@ -907,6 +1301,7 @@ function moveFile(index, offset) {
 function removeFile(index) {
   state.files.splice(index, 1);
   state.pageCount = null;
+  state.structureCount = 0;
   renderFiles();
   if (state.files.length === 0) setNotice("");
 }
@@ -914,6 +1309,9 @@ function removeFile(index) {
 function updateRunButton() {
   const count = state.files.length;
   const noFile = toolDetails[state.tool].noFile;
+  const ocrNeedsSetup = ["ocr-text", "ocr-searchable", "ocr-languages"].includes(state.tool) && !state.ocrAvailable;
+  const pdfaNeedsSetup = state.tool === "pdfa" && !state.pdfaAvailable;
+  const readingOrderUnavailable = state.tool === "reading-order" && !state.structureCount;
   const isComparison = ["compare-text", "compare-pages", "visual-diff"].includes(state.tool);
   const isSignatureTask = toolDetails[state.tool].requiresCertificate;
   const hasCertificatePair = count === 2
@@ -924,9 +1322,15 @@ function updateRunButton() {
     : state.tool === "merge" || isComparison
       ? count >= 2
       : count === 1 || state.tool === "image-to-pdf" && count > 0);
-  elements.runButton.disabled = state.busy || !enoughFiles;
+  elements.runButton.disabled = state.busy || !enoughFiles || ocrNeedsSetup || pdfaNeedsSetup || readingOrderUnavailable;
   elements.runLabel.textContent = state.busy
     ? "Working on your file…"
+    : pdfaNeedsSetup
+      ? "PDF/A setup required on server"
+    : ocrNeedsSetup
+      ? "Install Tesseract on the processing server"
+      : readingOrderUnavailable
+        ? "Choose a PDF with page-level tags"
     : noFile
       ? toolDetails[state.tool].action
     : isSignatureTask && count < 2
@@ -970,6 +1374,7 @@ function addFiles(fileList) {
   }
   state.files = combined;
   state.pageCount = null;
+  state.structureCount = 0;
   clearOutput();
   renderFiles();
   if (accepted.length > 0) setNotice("");
@@ -978,7 +1383,8 @@ function addFiles(fileList) {
 async function inspectSelectedPdf() {
   const wantsPageCount = ["split", "reorder", "extract", "delete-pages", "duplicate-pages", "insert-blank"].includes(state.tool);
   const wantsFormFields = state.tool === "fill-forms";
-  if ((!wantsPageCount && !wantsFormFields) || state.files.length !== 1 || !state.files[0].name.toLowerCase().endsWith(".pdf")) {
+  const wantsReadingOrder = state.tool === "reading-order";
+  if ((!wantsPageCount && !wantsFormFields && !wantsReadingOrder) || state.files.length !== 1 || !state.files[0].name.toLowerCase().endsWith(".pdf")) {
     elements.pageHint.textContent = "";
     return;
   }
@@ -994,6 +1400,11 @@ async function inspectSelectedPdf() {
       if (wantsPageCount) {
         state.pageCount = result.page_count;
         elements.pageHint.textContent = `${result.page_count} ${result.page_count === 1 ? "page" : "pages"}`;
+      } else if (wantsReadingOrder) {
+        state.structureCount = result.reading_order_count || 0;
+        elements.pageHint.textContent = state.structureCount
+          ? `${state.structureCount} page-level tags found`
+          : "No supported page-level tags found";
       } else {
         state.formFields = result.fields || [];
         elements.pageHint.textContent = state.formFields.length
@@ -1001,6 +1412,7 @@ async function inspectSelectedPdf() {
           : "No fillable fields found in this PDF";
       }
       renderOptions();
+      updateRunButton();
     }
   } catch (error) {
     elements.pageHint.textContent = "";
@@ -1030,6 +1442,7 @@ async function runTool() {
   state.files.forEach((file) => form.append("files", file, file.name));
   [
     "ranges", "rotation", "order", "language", "prefix", "label_style", "first_number",
+    "document_language", "structure_order",
     "margin", "page_size", "dpi", "quality", "watermark", "stamp_position", "header", "footer", "page_number",
     "title", "author", "subject", "keywords",
     "profile", "user_password", "owner_password", "password", "phrase", "comment",
@@ -1057,6 +1470,14 @@ async function runTool() {
     const filename = match ? match[1] : "processed-document";
     const inputBytes = Number(response.headers.get("x-input-bytes") || 0);
     const outputBytes = Number(response.headers.get("x-output-bytes") || blob.size);
+    const historySaved = toolDetails[state.tool].noFile || recordJobHistory({
+      toolId: state.tool === "workflow-builder" ? "batch" : state.tool,
+      toolName: toolDetails[state.tool].title,
+      inputNames: state.files.map((file) => file.name),
+      outputName: filename,
+      inputBytes,
+      outputBytes,
+    });
     const previousUrl = elements.download.dataset.objectUrl;
     if (previousUrl) URL.revokeObjectURL(previousUrl);
     elements.download.dataset.objectUrl = outputUrl;
@@ -1072,7 +1493,9 @@ async function runTool() {
     const sizeNote = state.tool === "compress" && outputBytes >= inputBytes
       ? "This file did not get smaller; the original is likely already optimized."
       : "Your processed file is ready to download from the server response.";
-    setNotice(sizeNote, "success");
+    setNotice(historySaved
+      ? sizeNote
+      : `${sizeNote} Local history could not be saved: ${jobHistoryError}`, historySaved ? "success" : "error");
   } catch (error) {
     setNotice(processingConnectionError(error), "error");
   } finally {
@@ -1148,10 +1571,12 @@ function renderCatalog() {
 }
 
 function showCatalog(show) {
+  if (show && state.tool === "watch-folder" && folderWatch.active) stopFolderWatch(false);
   elements.catalogView.hidden = !show;
   elements.workbench.hidden = show;
   document.querySelector(".page-intro").hidden = show;
   if (show) renderCatalog();
+  else if (state.tool === "watch-folder") renderOptions();
 }
 
 async function initialize() {
@@ -1162,6 +1587,8 @@ async function initialize() {
     if (!statusResponse.ok || !catalogResponse.ok) throw new Error("The processing server is not responding.");
     const status = await statusResponse.json();
     state.ocrAvailable = status.ocr_available;
+    state.pdfaAvailable = status.pdfa_available;
+    state.pdfaSetupMessage = status.pdfa_setup_message || "";
     state.workflowTools = status.workflow_tools;
     state.workflowOptions = status.workflow_options;
     state.catalog = await catalogResponse.json();
@@ -1169,7 +1596,7 @@ async function initialize() {
     const setupCount = state.catalog.filter((tool) => tool.status === "setup-required").length;
     const plannedCount = state.catalog.filter((tool) => tool.status === "planned").length;
     statusLabel.textContent = status.ocr_available ? "PDF + OCR engines ready" : "PDF engine ready · OCR setup needed";
-    if (["ocr-text", "ocr-searchable", "ocr-languages"].includes(state.tool) && !status.ocr_available) setTool(state.tool);
+    if (["ocr-text", "ocr-searchable", "ocr-languages", "pdfa"].includes(state.tool)) setTool(state.tool);
     document.querySelector("#catalog-count").textContent = `${state.catalog.length}`;
     elements.catalogSummary.textContent = `${readyCount} ready · ${setupCount} need server setup · ${plannedCount} planned.`;
     document.querySelector("#footer-count").textContent = `${readyCount} ready · ${setupCount} need setup · ${plannedCount} planned`;
@@ -1177,6 +1604,7 @@ async function initialize() {
       ? "OCR is ready on this computer."
         : "Install Tesseract and language data on the processing server to use OCR.";
     renderCatalog();
+    if (state.tool === "watch-folder" || state.tool === "history") renderOptions();
   } catch {
     statusLabel.textContent = "Processing server unavailable";
     setNotice("The processing server could not be reached. Check the server address and deployment status, then reload this page.", "error");
@@ -1217,6 +1645,7 @@ elements.catalogSearch.addEventListener("input", renderCatalog);
 window.addEventListener("beforeunload", () => {
   const outputUrl = elements.download.dataset.objectUrl;
   if (outputUrl) URL.revokeObjectURL(outputUrl);
+  stopFolderWatch(true);
 });
 
 setTool("merge");

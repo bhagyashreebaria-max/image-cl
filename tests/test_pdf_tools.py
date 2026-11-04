@@ -1,11 +1,15 @@
 import io
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import tempfile
 import unittest
 import zipfile
 from unittest.mock import patch
 import subprocess
 
 import pymupdf as fitz
+import pikepdf
 from pptx import Presentation
 from pptx.util import Inches
 from cryptography import x509
@@ -81,6 +85,11 @@ from app.pdf_tools import (
     excel_to_pdf,
     decrypt_pdf,
     epub_to_pdf,
+    convert_pdfa,
+    pdfa_setup_available,
+    reading_order_entry_count,
+    set_reading_order,
+    tag_pdf_structure,
 )
 
 
@@ -147,15 +156,204 @@ class PDFToolsTests(unittest.TestCase):
         self.assertGreaterEqual(len(TOOL_CATALOG), 50)
 
     def test_catalog_reports_available_tools_as_ready(self):
-        from app.catalog import READY_TOOL_IDS, get_tool_catalog
+        from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, get_tool_catalog
 
         catalog = get_tool_catalog(ocr_available=False)
         statuses = {tool["id"]: tool["status"] for tool in catalog}
-        setup_tools = {"ocr-text", "ocr-searchable", "ocr-languages"}
+        setup_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
         self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in READY_TOOL_IDS - setup_tools))
+        self.assertEqual(BROWSER_ONLY_TOOL_IDS, {"watch-folder", "history"})
+        self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in BROWSER_ONLY_TOOL_IDS))
         self.assertEqual(statuses["ocr-text"], "setup-required")
         self.assertEqual(statuses["ocr-searchable"], "setup-required")
         self.assertEqual(statuses["ocr-languages"], "setup-required")
+        self.assertEqual(statuses["pdfa"], "setup-required")
+
+    def test_pdfa_setup_rejects_malformed_icc_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "invalid.icc"
+            profile.write_bytes(b"not an ICC profile")
+            environ = {
+                "PAPERTRAIL_GHOSTSCRIPT": "ghostscript",
+                "PAPERTRAIL_VERAPDF": "verapdf",
+                "PAPERTRAIL_PDFA_ICC_PROFILE": str(profile),
+                "PAPERTRAIL_PDFA_OUTPUT_CONDITION": "test",
+            }
+            with patch.dict(os.environ, environ, clear=True), patch(
+                "app.pdf_tools.shutil.which", side_effect=lambda name: name
+            ):
+                with self.assertRaisesRegex(ToolError, "readable RGB ICC profile"):
+                    convert_pdfa("source.pdf", make_pdf("sample"))
+
+    def test_browser_only_tools_cannot_be_submitted_to_processing_endpoint(self):
+        client = TestClient(app)
+        for tool in ("watch-folder", "history"):
+            with self.subTest(tool=tool):
+                response = client.post(
+                    f"/api/process/{tool}",
+                    headers={"origin": "http://localhost:8000"},
+                    files={"files": ("document.pdf", make_pdf("sample"), "application/pdf")},
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_api_tagging_inspection_and_reading_order(self):
+        client = TestClient(app)
+        source = make_pdf("first page", "second page")
+        tagged = client.post(
+            "/api/process/tag-pdf",
+            headers={"origin": "http://localhost:8000"},
+            files={"files": ("source.pdf", source, "application/pdf")},
+            data={"document_language": "en-GB"},
+        )
+        self.assertEqual(tagged.status_code, 200, tagged.text)
+
+        inspected = client.post(
+            "/api/inspect",
+            headers={"origin": "http://localhost:8000"},
+            files={"file": ("tagged.pdf", tagged.content, "application/pdf")},
+        )
+        self.assertEqual(inspected.status_code, 200, inspected.text)
+        self.assertEqual(inspected.json()["reading_order_count"], 2)
+
+        reordered = client.post(
+            "/api/process/reading-order",
+            headers={"origin": "http://localhost:8000"},
+            files={"files": ("tagged.pdf", tagged.content, "application/pdf")},
+            data={"structure_order": "2, 1"},
+        )
+        self.assertEqual(reordered.status_code, 200, reordered.text)
+        with pikepdf.Pdf.open(io.BytesIO(reordered.content)) as document:
+            page_objects = [page.obj.objgen for page in document.pages]
+            children = list(document.Root.StructTreeRoot.K.K)
+            self.assertEqual([child.Pg.objgen for child in children], [page_objects[1], page_objects[0]])
+
+    def test_api_pdfa_reports_missing_server_setup(self):
+        client = TestClient(app)
+        with patch("app.main.pdfa_setup_available", return_value=False), patch(
+            "app.main.pdfa_setup_error", return_value="PDF/A-2b requires Ghostscript and veraPDF."
+        ):
+            response = client.post(
+                "/api/process/pdfa",
+                headers={"origin": "http://localhost:8000"},
+                files={"files": ("source.pdf", make_pdf("sample"), "application/pdf")},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Ghostscript and veraPDF", response.json()["detail"])
+
+    def test_basic_structure_tags_preserve_pages_and_support_page_reading_order(self):
+        source = make_pdf("first page", "second page")
+        self.assertEqual(reading_order_entry_count("source.pdf", source), 0)
+        tagged = tag_pdf_structure("source.pdf", source, "en-US")
+        self.assertEqual(reading_order_entry_count("tagged.pdf", tagged.data), 2)
+
+        with pikepdf.Pdf.open(io.BytesIO(tagged.data)) as document:
+            root = document.Root.StructTreeRoot
+            self.assertTrue(document.Root.MarkInfo.Marked)
+            self.assertEqual(str(document.Root.Lang), "en-US")
+            self.assertEqual(root.K.S, pikepdf.Name.Document)
+            page_elements = list(root.K.K)
+            self.assertEqual(len(page_elements), 2)
+            self.assertTrue(all(element.S == pikepdf.Name.P for element in page_elements))
+            self.assertTrue(all(element.P.S == pikepdf.Name.Document for element in page_elements))
+
+        reordered = set_reading_order("tagged.pdf", tagged.data, "2, 1")
+        self.assertEqual(reading_order_entry_count("reordered.pdf", reordered.data), 2)
+        with pikepdf.Pdf.open(io.BytesIO(reordered.data)) as document:
+            children = list(document.Root.StructTreeRoot.K.K)
+            page_objects = [page.obj.objgen for page in document.pages]
+            self.assertEqual([child.Pg.objgen for child in children], [page_objects[1], page_objects[0]])
+        visual_document = fitz.open(stream=reordered.data, filetype="pdf")
+        self.assertEqual(visual_document[0].get_text().strip(), "first page")
+        self.assertEqual(visual_document[1].get_text().strip(), "second page")
+        visual_document.close()
+
+    def test_basic_structure_tags_reject_existing_or_unreadable_structure(self):
+        with self.assertRaisesRegex(ToolError, "valid document language"):
+            tag_pdf_structure("source.pdf", make_pdf("text"), "not a language tag")
+        blank = fitz.open()
+        blank.new_page()
+        blank_data = blank.tobytes()
+        blank.close()
+        with self.assertRaisesRegex(ToolError, "selectable text on every page"):
+            tag_pdf_structure("blank.pdf", blank_data, "en")
+        tagged = tag_pdf_structure("source.pdf", make_pdf("text"), "en")
+        with self.assertRaisesRegex(ToolError, "does not replace existing"):
+            tag_pdf_structure("tagged.pdf", tagged.data, "en")
+        with self.assertRaisesRegex(ToolError, "requires a PDF tagged"):
+            set_reading_order("source.pdf", make_pdf("text"), "1")
+        with self.assertRaisesRegex(ToolError, "each page"):
+            set_reading_order("tagged.pdf", tagged.data, "1, 1")
+
+    def test_pdfa_setup_requires_ghostscript_verapdf_and_icc_profile(self):
+        with patch.dict(os.environ, {}, clear=True), patch("app.pdf_tools.shutil.which", return_value=None):
+            with self.assertRaisesRegex(ToolError, "Ghostscript.*veraPDF.*ICC profile") as error:
+                convert_pdfa("source.pdf", make_pdf("sample"))
+        self.assertEqual(error.exception.status_code, 503)
+
+    def test_pdfa_conversion_requires_a_passing_verapdf_report(self):
+        source = make_pdf("PDF/A conversion")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ghostscript = root / "gs.exe"
+            ghostscript.touch()
+            icc_profile = root / "srgb.icc"
+            profile_bytes = bytearray(128)
+            profile_bytes[0:4] = (128).to_bytes(4, "big")
+            profile_bytes[16:20] = b"RGB "
+            profile_bytes[36:40] = b"acsp"
+            icc_profile.write_bytes(profile_bytes)
+            environ = {
+                "PAPERTRAIL_GHOSTSCRIPT": str(ghostscript),
+                "PAPERTRAIL_VERAPDF": "verapdf",
+                "PAPERTRAIL_PDFA_ICC_PROFILE": str(icc_profile),
+                "PAPERTRAIL_PDFA_OUTPUT_CONDITION": "sRGB (test)",
+            }
+            definition_text = {}
+
+            def fake_run(command, **kwargs):
+                if command[0] == str(ghostscript):
+                    output_path = Path(next(argument.split("=", 1)[1] for argument in command if argument.startswith("-sOutputFile=")))
+                    output_path.write_bytes(source)
+                    definition_path = Path(next(argument for argument in command if argument.endswith("PDFA_def.ps")))
+                    definition_text["value"] = definition_path.read_text(encoding="ascii")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout='<report><jobs><job><validationReport isCompliant="true"/></job></jobs></report>',
+                    stderr="",
+                )
+
+            with patch.dict(os.environ, environ, clear=True), patch(
+                "app.pdf_tools.shutil.which", side_effect=lambda name: str(root / "verapdf.exe") if name == "verapdf" else None
+            ), patch("app.pdf_tools.subprocess.run", side_effect=fake_run) as run:
+                result = convert_pdfa("source.pdf", source)
+                self.assertEqual(result.filename, "source-pdfa-2b.pdf")
+                self.assertTrue(pdfa_setup_available())
+                self.assertEqual(run.call_count, 2)
+                gs_arguments = run.call_args_list[0].args[0]
+                self.assertIn("-dPDFA=2", gs_arguments)
+                self.assertIn("-dPDFACompatibilityPolicy=2", gs_arguments)
+                self.assertIn("/OutputConditionIdentifier (sRGB \\(test\\))", definition_text["value"])
+                self.assertIn("-f", run.call_args_list[1].args[0])
+
+            def fake_noncompliant_run(command, **kwargs):
+                if command[0] == str(ghostscript):
+                    output_path = Path(next(argument.split("=", 1)[1] for argument in command if argument.startswith("-sOutputFile=")))
+                    output_path.write_bytes(source)
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout='<report><jobs><job><validationReport isCompliant="false"/></job></jobs></report>',
+                    stderr="",
+                )
+
+            with patch.dict(os.environ, environ, clear=True), patch(
+                "app.pdf_tools.shutil.which", side_effect=lambda name: str(root / "verapdf.exe") if name == "verapdf" else None
+            ), patch("app.pdf_tools.subprocess.run", side_effect=fake_noncompliant_run):
+                with self.assertRaisesRegex(ToolError, "did not pass veraPDF"):
+                    convert_pdfa("source.pdf", source)
 
     def test_api_exposes_exact_batch_workflow_options(self):
         from app.pdf_tools import BATCH_OPTION_KEYS, BATCH_TOOLS
