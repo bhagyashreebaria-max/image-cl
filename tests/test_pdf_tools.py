@@ -1,3 +1,4 @@
+import asyncio
 import io
 from datetime import datetime, timedelta, timezone
 import os
@@ -10,6 +11,7 @@ import subprocess
 
 import pymupdf as fitz
 import pikepdf
+from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
 from cryptography import x509
@@ -18,10 +20,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, pkcs12
 from fastapi.testclient import TestClient
 
-from app.catalog import TOOL_CATALOG
-from app.main import app
+from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, TOOL_CATALOG
+from app.main import MAX_CONCURRENT_JOBS, MAX_INPUT_FILES, app
 from app.pdf_tools import (
     ToolError,
+    ToolResult,
     add_headers_footers_pdf,
     accessible_text_export,
     run_tool,
@@ -156,18 +159,66 @@ class PDFToolsTests(unittest.TestCase):
         self.assertGreaterEqual(len(TOOL_CATALOG), 50)
 
     def test_catalog_reports_available_tools_as_ready(self):
-        from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, get_tool_catalog
+        from app.catalog import get_tool_catalog
 
         catalog = get_tool_catalog(ocr_available=False)
         statuses = {tool["id"]: tool["status"] for tool in catalog}
         setup_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
         self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in READY_TOOL_IDS - setup_tools))
-        self.assertEqual(BROWSER_ONLY_TOOL_IDS, {"watch-folder", "history"})
+        self.assertEqual(
+            BROWSER_ONLY_TOOL_IDS,
+            {"watch-folder", "history", "presets", "workflow-builder"},
+        )
         self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in BROWSER_ONLY_TOOL_IDS))
         self.assertEqual(statuses["ocr-text"], "setup-required")
         self.assertEqual(statuses["ocr-searchable"], "setup-required")
         self.assertEqual(statuses["ocr-languages"], "setup-required")
         self.assertEqual(statuses["pdfa"], "setup-required")
+
+    def test_processing_endpoint_dispatches_every_server_tool(self):
+        client = TestClient(app)
+        server_tools = READY_TOOL_IDS - BROWSER_ONLY_TOOL_IDS - {"ocr-languages"}
+        sample_pdf = make_pdf("sample")
+        with patch("app.main.run_tool", return_value=ToolResult(b"processed", "result.pdf")) as process:
+            with patch("app.main.pdfa_setup_available", return_value=True), patch(
+                "app.main.shutil.which", return_value="tesseract"
+            ):
+                for tool in sorted(server_tools):
+                    with self.subTest(tool=tool):
+                        response = client.post(
+                            f"/api/process/{tool}",
+                            headers={"origin": "http://localhost:8000"},
+                            files={"files": ("document.pdf", sample_pdf, "application/pdf")},
+                        )
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(process.call_args.args[0], tool)
+
+    def test_processing_capacity_returns_retryable_status(self):
+        with patch("app.main.processing_slots", asyncio.Semaphore(0)), patch(
+            "app.main.PROCESSING_QUEUE_TIMEOUT_SECONDS", 0.01
+        ), TestClient(app) as client:
+            for path, field in (("/api/process/merge", "files"), ("/api/inspect", "file")):
+                with self.subTest(path=path):
+                    response = client.post(
+                        path,
+                        headers={"origin": "http://localhost:8000"},
+                        files={field: ("document.pdf", make_pdf("sample"), "application/pdf")},
+                    )
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(response.headers["retry-after"], "5")
+
+    def test_api_limits_number_of_uploaded_files(self):
+        client = TestClient(app)
+        files = [
+            ("files", (f"document-{index}.pdf", b"pdf", "application/pdf"))
+            for index in range(MAX_INPUT_FILES + 1)
+        ]
+        response = client.post(
+            "/api/process/merge",
+            headers={"origin": "http://localhost:8000"},
+            files=files,
+        )
+        self.assertEqual(response.status_code, 413)
 
     def test_pdfa_setup_rejects_malformed_icc_profile(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -187,7 +238,7 @@ class PDFToolsTests(unittest.TestCase):
 
     def test_browser_only_tools_cannot_be_submitted_to_processing_endpoint(self):
         client = TestClient(app)
-        for tool in ("watch-folder", "history"):
+        for tool in BROWSER_ONLY_TOOL_IDS:
             with self.subTest(tool=tool):
                 response = client.post(
                     f"/api/process/{tool}",
@@ -361,6 +412,7 @@ class PDFToolsTests(unittest.TestCase):
         response = TestClient(app).get("/api/status")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(payload["max_concurrent_jobs"], MAX_CONCURRENT_JOBS)
         self.assertEqual(set(payload["workflow_tools"]), BATCH_TOOLS)
         self.assertEqual(
             {tool: set(options) for tool, options in payload["workflow_options"].items()},
@@ -473,6 +525,29 @@ class PDFToolsTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(result.data)) as archive:
             self.assertEqual(archive.namelist(), ["report-page-0001.png"])
             self.assertTrue(archive.read(archive.namelist()[0]).startswith(b"\x89PNG"))
+
+    def test_raster_operations_reject_excessive_pixel_work_before_rendering(self):
+        document = fitz.open()
+        document.new_page(width=20_000, height=20_000)
+        oversized_pdf = document.tobytes()
+        document.close()
+
+        with patch("app.pdf_tools.fitz.Page.get_pixmap") as render_page:
+            operations = (
+                lambda: pdf_to_images("large.pdf", oversized_pdf, 120),
+                lambda: grayscale_pdf("large.pdf", oversized_pdf, 120),
+                lambda: deskew_pdf("large.pdf", oversized_pdf),
+                lambda: deduplicate_pages_pdf("large.pdf", oversized_pdf),
+            )
+            for operation in operations:
+                with self.subTest(operation=operation):
+                    with self.assertRaisesRegex(ToolError, "8 million rendered pixels per page"):
+                        operation()
+            render_page.assert_not_called()
+
+        many_pages = make_pdf(*(["sample"] * 11))
+        with self.assertRaisesRegex(ToolError, "40 million rendered pixels per operation"):
+            pdf_to_images("many-pages.pdf", many_pages, 200)
 
     def test_pdf_to_text_extracts_page_text(self):
         result = pdf_to_text("report.pdf", make_pdf("sample words"))
@@ -731,6 +806,12 @@ class PDFToolsTests(unittest.TestCase):
         self.assertEqual(round(document[0].rect.width), 24)
         self.assertEqual(round(document[0].rect.height), 18)
         document.close()
+
+    def test_image_conversion_rejects_excessive_pixel_work(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (3_000, 3_000)).save(image_buffer, format="PNG")
+        with self.assertRaisesRegex(ToolError, "8 million pixels per page"):
+            images_to_pdf([("large.png", image_buffer.getvalue())])
 
     def test_compression_returns_a_valid_pdf_and_size_metadata(self):
         source = make_pdf("sample")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -16,6 +17,7 @@ from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, get_tool_catalog
 from app.pdf_tools import (
     BATCH_OPTION_KEYS,
     BATCH_TOOLS,
+    MAX_INPUT_FILES,
     MAX_UPLOAD_BYTES,
     ToolError,
     form_fields,
@@ -32,6 +34,14 @@ logger = logging.getLogger("papertrail-pdf-toolkit")
 
 STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="Papertrail PDF Toolkit", docs_url=None, redoc_url=None)
+try:
+    MAX_CONCURRENT_JOBS = int(os.environ.get("PAPERTRAIL_MAX_CONCURRENT_JOBS", "2"))
+except ValueError as error:
+    raise RuntimeError("PAPERTRAIL_MAX_CONCURRENT_JOBS must be an integer from 1 to 64.") from error
+if not 1 <= MAX_CONCURRENT_JOBS <= 64:
+    raise RuntimeError("PAPERTRAIL_MAX_CONCURRENT_JOBS must be an integer from 1 to 64.")
+PROCESSING_QUEUE_TIMEOUT_SECONDS = 30
+processing_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 configured_origins = os.environ.get("PAPERTRAIL_ALLOWED_ORIGINS")
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -62,6 +72,27 @@ async def protect_api_origin(request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def limit_processing_concurrency(request, call_next):
+    if request.url.path != "/api/inspect" and not request.url.path.startswith("/api/process/"):
+        return await call_next(request)
+    try:
+        await asyncio.wait_for(
+            processing_slots.acquire(),
+            timeout=PROCESSING_QUEUE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return Response(
+            "The processing service is at capacity. Please retry shortly.",
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    try:
+        return await call_next(request)
+    finally:
+        processing_slots.release()
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
@@ -86,6 +117,7 @@ async def get_status():
         "workflow_tools": sorted(BATCH_TOOLS),
         "workflow_options": {tool: sorted(options) for tool, options in BATCH_OPTION_KEYS.items()},
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
     }
 
 
@@ -101,10 +133,26 @@ async def get_tools():
 @app.get("/api/ocr-languages")
 async def get_ocr_languages():
     try:
-        languages = list_ocr_languages()
+        languages = await run_in_threadpool(list_ocr_languages)
     except ToolError as error:
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
     return {"languages": languages}
+
+
+def inspect_pdf_data(filename: str, data: bytes) -> dict[str, object]:
+    document = open_pdf(data, filename)
+    try:
+        fields = [
+            {"name": widget.field_name, "type": widget.field_type_string}
+            for widget in form_fields(document)
+        ]
+        return {
+            "page_count": document.page_count,
+            "fields": fields,
+            "reading_order_count": reading_order_entry_count(filename, data),
+        }
+    finally:
+        document.close()
 
 
 @app.post("/api/inspect")
@@ -116,22 +164,13 @@ async def inspect_pdf(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than the 80 MiB server limit.")
     try:
-        document = open_pdf(data, file.filename or "document.pdf")
+        return await run_in_threadpool(
+            inspect_pdf_data,
+            file.filename or "document.pdf",
+            data,
+        )
     except ToolError as error:
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
-    try:
-        fields = [
-            {"name": widget.field_name, "type": widget.field_type_string}
-            for widget in form_fields(document)
-        ]
-        structure_count = reading_order_entry_count(file.filename or "document.pdf", data)
-        return {
-            "page_count": document.page_count,
-            "fields": fields,
-            "reading_order_count": structure_count,
-        }
-    finally:
-        document.close()
 
 
 @app.post("/api/process/{tool}")
@@ -178,6 +217,8 @@ async def process_pdf(
 ):
     if tool not in READY_TOOL_IDS or tool in BROWSER_ONLY_TOOL_IDS:
         raise HTTPException(status_code=404, detail="That tool is not available yet.")
+    if len(files) > MAX_INPUT_FILES:
+        raise HTTPException(status_code=413, detail=f"An operation can include at most {MAX_INPUT_FILES} files.")
     if tool == "pdfa" and not pdfa_setup_available():
         raise HTTPException(status_code=503, detail=pdfa_setup_error())
     payloads: list[tuple[str, bytes]] = []
