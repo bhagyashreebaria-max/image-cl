@@ -7,6 +7,7 @@ import json
 import os
 from html import escape
 from html.parser import HTMLParser
+from math import ceil
 import posixpath
 from io import BytesIO
 import re
@@ -50,6 +51,10 @@ MAX_SCAN_PAGES = 100
 MAX_SCAN_PIXELS = 8_000_000
 MAX_SLIDE_PAGES = 100
 MAX_SLIDE_TOTAL_PIXELS = 40_000_000
+MAX_RENDERED_PAGE_PIXELS = 8_000_000
+MAX_RENDERED_TOTAL_PIXELS = 40_000_000
+MAX_IMAGE_PAGES = 100
+MAX_INPUT_FILES = 100
 BATCH_TOOLS = {
     "compress", "compress-images", "crop-pages", "deduplicate", "delete-pages", "draw",
     "duplicate-pages", "edit-metadata", "encrypt", "extract", "flatten-forms",
@@ -132,6 +137,39 @@ def open_pdf(data: bytes, filename: str, password: str = "") -> fitz.Document:
         document.close()
         raise ToolError(f"{filename}: the PDF has no pages.")
     return document
+
+
+def validate_rendered_pixels(document: fitz.Document, dpi: int, operation: str) -> None:
+    total_pixels = 0
+    for page in document:
+        width = max(1, ceil(page.rect.width * dpi / 72))
+        height = max(1, ceil(page.rect.height * dpi / 72))
+        page_pixels = width * height
+        if page_pixels > MAX_RENDERED_PAGE_PIXELS:
+            raise ToolError(f"{operation} is limited to 8 million rendered pixels per page.")
+        total_pixels += page_pixels
+        if total_pixels > MAX_RENDERED_TOTAL_PIXELS:
+            raise ToolError(f"{operation} is limited to 40 million rendered pixels per operation.")
+
+
+def image_frame_pixels(data: bytes, filename: str) -> tuple[int, int]:
+    try:
+        with Image.open(BytesIO(data)) as image:
+            frame_count = getattr(image, "n_frames", 1)
+            if frame_count > MAX_IMAGE_PAGES:
+                raise ToolError(f"Image conversion is limited to {MAX_IMAGE_PAGES} pages per operation.")
+            total_pixels = 0
+            for frame in range(frame_count):
+                image.seek(frame)
+                pixels = image.width * image.height
+                if pixels > MAX_RENDERED_PAGE_PIXELS:
+                    raise ToolError("Image conversion is limited to 8 million pixels per page.")
+                total_pixels += pixels
+                if total_pixels > MAX_RENDERED_TOTAL_PIXELS:
+                    raise ToolError("Image conversion is limited to 40 million pixels per operation.")
+            return frame_count, total_pixels
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        raise ToolError(f"{filename}: the image could not be decoded.") from error
 
 
 def parse_page_groups(value: str, page_count: int) -> list[list[int]]:
@@ -373,11 +411,20 @@ def images_to_pdf(files: Sequence[tuple[str, bytes]]) -> ToolResult:
         raise ToolError("Choose one or more images.")
     output = fitz.open()
     total_bytes = sum(len(data) for _, data in files)
+    total_pages = 0
+    total_pixels = 0
     try:
         for name, data in files:
             extension = PurePath(name).suffix.lower().lstrip(".")
             if extension not in IMAGE_TYPES:
                 raise ToolError(f"{name}: use PNG, JPEG, BMP, or TIFF images.")
+            frame_count, image_pixels = image_frame_pixels(data, name)
+            total_pages += frame_count
+            total_pixels += image_pixels
+            if total_pages > MAX_IMAGE_PAGES:
+                raise ToolError(f"Image conversion is limited to {MAX_IMAGE_PAGES} pages per operation.")
+            if total_pixels > MAX_RENDERED_TOTAL_PIXELS:
+                raise ToolError("Image conversion is limited to 40 million pixels per operation.")
             try:
                 image = fitz.open(stream=data, filetype=extension)
                 try:
@@ -456,6 +503,7 @@ def pdf_to_images(filename: str, data: bytes, dpi: int) -> ToolResult:
     document = open_pdf(data, filename)
     archive_buffer = BytesIO()
     try:
+        validate_rendered_pixels(document, dpi, "PDF-to-images")
         with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for page_number, page in enumerate(document, start=1):
                 pixmap = page.get_pixmap(dpi=dpi, alpha=False)
@@ -1301,6 +1349,7 @@ def grayscale_pdf(filename: str, data: bytes, dpi: int) -> ToolResult:
     source = open_pdf(data, filename)
     output = fitz.open()
     try:
+        validate_rendered_pixels(source, dpi, "Grayscale conversion")
         for page in source:
             pixmap = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
             target = output.new_page(width=page.rect.width, height=page.rect.height)
@@ -1333,10 +1382,10 @@ def scan_processing_pdf(filename: str, data: bytes, *, deskew: bool) -> ToolResu
     try:
         if source.page_count > MAX_SCAN_PAGES:
             raise ToolError(f"Scan processing is limited to {MAX_SCAN_PAGES} pages per operation.")
+        operation = "Deskew" if deskew else "Scan enhancement"
+        validate_rendered_pixels(source, 120, operation)
         for page in source:
             pixmap = page.get_pixmap(dpi=120, colorspace=fitz.csGRAY, alpha=False)
-            if pixmap.width * pixmap.height > MAX_SCAN_PIXELS:
-                raise ToolError("A page exceeds the scan-processing pixel limit.")
             image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("L")
             if deskew:
                 angle = estimate_skew_angle(image)
@@ -1369,6 +1418,7 @@ def enhance_scan_pdf(filename: str, data: bytes) -> ToolResult:
 def deduplicate_pages_pdf(filename: str, data: bytes) -> ToolResult:
     document = open_pdf(data, filename)
     try:
+        validate_rendered_pixels(document, 72, "Duplicate-page detection")
         seen: set[tuple[int, int, str]] = set()
         unique_indexes = []
         for index, page in enumerate(document):
@@ -1719,6 +1769,7 @@ def compare_page_renderings(files: Sequence[tuple[str, bytes]], visual_diff: boo
     changed_summary = []
     try:
         page_total = max(doc.page_count for doc in documents)
+        total_pixels = 0
         for index in range(page_total):
             page_rects = [
                 doc[index].rect if index < doc.page_count else fitz.Rect(0, 0, 612, 792)
@@ -1730,6 +1781,9 @@ def compare_page_renderings(files: Sequence[tuple[str, bytes]], visual_diff: boo
                 raise ToolError(
                     f"Page {index + 1} is too large for a visual comparison. Use the text comparison or split the document."
                 )
+            total_pixels += ceil(width) * ceil(height)
+            if total_pixels > MAX_RENDERED_TOTAL_PIXELS:
+                raise ToolError("Page comparison is limited to 40 million rendered pixels per operation.")
             if visual_diff:
                 left_doc, right_doc = fitz.open(), fitz.open()
                 try:
@@ -2022,6 +2076,9 @@ def ocr_to_text(filename: str, data: bytes, language: str) -> ToolResult:
         )
     document = open_pdf(data, filename)
     try:
+        if document.page_count > MAX_OCR_PAGES:
+            raise ToolError(f"OCR is limited to {MAX_OCR_PAGES} pages per operation.")
+        validate_rendered_pixels(document, 200, "OCR")
         extracted = []
         for page_number, page in enumerate(document, start=1):
             try:
@@ -2057,6 +2114,7 @@ def ocr_searchable_pdf(filename: str, data: bytes, language: str) -> ToolResult:
     try:
         if source.page_count > MAX_OCR_PAGES:
             raise ToolError(f"Searchable OCR is limited to {MAX_OCR_PAGES} pages per operation.")
+        validate_rendered_pixels(source, 200, "Searchable OCR")
         for page in source:
             image = page.get_pixmap(dpi=200, alpha=False).tobytes("png")
             try:

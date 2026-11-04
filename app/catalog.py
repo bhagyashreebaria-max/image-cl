@@ -150,7 +150,7 @@ READY_TOOL_IDS = {
     "reading-order",
 }
 
-BROWSER_ONLY_TOOL_IDS = {"watch-folder", "history"}
+BROWSER_ONLY_TOOL_IDS = {"watch-folder", "history", "presets", "workflow-builder"}
 
 
 def get_tool_catalog(*, ocr_available: bool, pdfa_available: bool = False) -> list[dict[str, str]]:
