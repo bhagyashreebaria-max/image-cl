@@ -6,9 +6,6 @@ const state = {
   formFields: [],
   category: "All",
   busy: false,
-  ocrAvailable: false,
-  pdfaAvailable: false,
-  pdfaSetupMessage: "",
   structureCount: 0,
   workflowTools: [],
   workflowOptions: {},
@@ -105,41 +102,6 @@ const toolDetails = {
     action: "Optimize PDF",
     fileType: "PDF",
   },
-  "ocr-text": {
-    title: "OCR to text",
-    accept: ".pdf,application/pdf",
-    multiple: false,
-    subtitle: "or browse your computer",
-    limit: "PDF · up to 80 MiB",
-    note: "Requires Tesseract installed on the processing server",
-    action: "Extract text",
-    fileType: "PDF",
-    extensions: ["pdf"],
-    fileKind: "pdf",
-  },
-  "ocr-searchable": {
-    title: "Create searchable PDF",
-    accept: ".pdf,application/pdf",
-    multiple: false,
-    subtitle: "or browse your computer",
-    limit: "PDF · up to 80 MiB",
-    note: "Requires Tesseract and language data on the processing server; limited to 100 pages",
-    action: "Make searchable",
-    fileType: "PDF",
-    extensions: ["pdf"],
-    fileKind: "pdf",
-  },
-  "ocr-languages": {
-    title: "View installed OCR languages",
-    accept: "",
-    extensions: [],
-    multiple: false,
-    noFile: true,
-    limit: "No document upload required",
-    note: "Lists Tesseract language data installed on the processing server",
-    action: "Check server languages",
-    fileType: "INFO",
-  },
   extract: pdfTool("Extract page ranges", "Extract pages", "Enter the pages to keep in the extracted PDF."),
   "delete-pages": pdfTool("Delete pages", "Remove pages", "The page ranges entered here will be removed."),
   "duplicate-pages": pdfTool("Duplicate pages", "Duplicate pages", "Each selected page will be duplicated immediately after itself."),
@@ -152,7 +114,6 @@ const toolDetails = {
   "pdf-to-text": pdfTool("PDF to text", "Extract text", "Text-based PDFs work best. Scanned pages require OCR."),
   "pdf-to-markdown": pdfTool("PDF to Markdown", "Export Markdown", "Extracts page text with Markdown page headings; complex layout is not reconstructed."),
   "accessible-text": pdfTool("Export accessible text", "Export readable text", "Extracts text blocks in top-to-bottom reading order with page headings."),
-  pdfa: pdfTool("Convert to PDF/A-2b", "Convert to PDF/A-2b", "Uses Ghostscript and validates the result with veraPDF; an RGB ICC profile and server setup are required."),
   "tag-pdf": {
     ...pdfTool("Add basic structure tags", "Add page-level tags", "Adds one paragraph tag per text page and sets the document language. This is not PDF/UA conformance tagging."),
   },
@@ -997,21 +958,14 @@ function setTool(tool) {
   elements.dropSubtitle.textContent = "or browse your computer";
   elements.fileLimit.textContent = details.limit;
   elements.settingsNote.textContent = details.note;
-  const ocrNeedsSetup = ["ocr-text", "ocr-searchable", "ocr-languages"].includes(tool) && !state.ocrAvailable;
-  const pdfaNeedsSetup = tool === "pdfa" && !state.pdfaAvailable;
-  const setupRequired = ocrNeedsSetup || pdfaNeedsSetup;
   const browserManaged = Boolean(details.browserManaged);
   const statusTag = document.querySelector("#tool-status");
-  statusTag.classList.toggle("needs-setup", setupRequired);
+  statusTag.classList.remove("needs-setup");
   statusTag.classList.toggle("local-only", Boolean(details.localOnly));
   statusTag.lastChild.textContent = browserManaged
     ? "BROWSER WATCH"
     : details.localOnly
       ? "BROWSER ONLY"
-    : pdfaNeedsSetup
-      ? "PDF/A SETUP NEEDED"
-      : ocrNeedsSetup
-        ? "TESSERACT NEEDED"
       : "READY TO RUN";
   elements.privacyNote.lastChild.textContent = browserManaged
     ? "Folder access stays in this browser"
@@ -1050,13 +1004,6 @@ function clearOutput() {
 
 function renderOptions() {
   elements.options.replaceChildren();
-  if (state.tool === "pdfa" && !state.pdfaAvailable) {
-    const note = document.createElement("p");
-    note.className = "option-callout";
-    note.textContent = state.pdfaSetupMessage || "PDF/A-2b needs Ghostscript, veraPDF, and a readable RGB ICC profile configured on the processing server.";
-    elements.options.append(note);
-    return;
-  }
   if (state.tool === "watch-folder") {
     renderFolderWatcher();
     return;
@@ -1071,13 +1018,6 @@ function renderOptions() {
   }
   if (state.tool === "presets") {
     renderPresetManager();
-    return;
-  }
-  if (toolDetails[state.tool].noFile) {
-    const note = document.createElement("p");
-    note.className = "option-callout";
-    note.textContent = "This checks the languages currently installed on the processing server. It does not install language packs.";
-    elements.options.append(note);
     return;
   }
   const addField = (labelText, id, type, value, options = {}) => {
@@ -1131,11 +1071,6 @@ function renderOptions() {
       placeholder: state.pageCount ? Array.from({ length: state.pageCount }, (_, index) => index + 1).join(",") : "3, 1, 2",
       inputMode: "numeric",
       hint: state.pageCount ? `Use each page from 1 to ${state.pageCount} exactly once.` : "Choose a PDF to see its page count.",
-    });
-  } else if (["ocr-text", "ocr-searchable"].includes(state.tool)) {
-    addField("OCR language", "language", "select", "eng", {
-      choices: [["eng", "English"], ["hin", "Hindi"], ["eng+hin", "English + Hindi"]],
-      hint: "The matching Tesseract language data must be installed on the processing server.",
     });
   } else if (state.tool === "tag-pdf") {
     addField("Document language", "document_language", "text", "en-US", {
@@ -1309,8 +1244,6 @@ function removeFile(index) {
 function updateRunButton() {
   const count = state.files.length;
   const noFile = toolDetails[state.tool].noFile;
-  const ocrNeedsSetup = ["ocr-text", "ocr-searchable", "ocr-languages"].includes(state.tool) && !state.ocrAvailable;
-  const pdfaNeedsSetup = state.tool === "pdfa" && !state.pdfaAvailable;
   const readingOrderUnavailable = state.tool === "reading-order" && !state.structureCount;
   const isComparison = ["compare-text", "compare-pages", "visual-diff"].includes(state.tool);
   const isSignatureTask = toolDetails[state.tool].requiresCertificate;
@@ -1322,28 +1255,24 @@ function updateRunButton() {
     : state.tool === "merge" || isComparison
       ? count >= 2
       : count === 1 || state.tool === "image-to-pdf" && count > 0);
-  elements.runButton.disabled = state.busy || !enoughFiles || ocrNeedsSetup || pdfaNeedsSetup || readingOrderUnavailable;
+  elements.runButton.disabled = state.busy || !enoughFiles || readingOrderUnavailable;
   elements.runLabel.textContent = state.busy
     ? "Working on your file…"
-    : pdfaNeedsSetup
-      ? "PDF/A setup required on server"
-    : ocrNeedsSetup
-      ? "Install Tesseract on the processing server"
-      : readingOrderUnavailable
-        ? "Choose a PDF with page-level tags"
-    : noFile
-      ? toolDetails[state.tool].action
-    : isSignatureTask && count < 2
-      ? "Add one PDF and one certificate"
-    : isSignatureTask && !hasCertificatePair
-      ? "Choose one PDF and one PFX/P12"
-    : count === 0
-      ? "Choose files to continue"
-      : state.tool === "merge" && count < 2
-        ? "Add one more PDF"
-        : isComparison && count < 2
-          ? "Add a second PDF"
-        : toolDetails[state.tool].action;
+    : readingOrderUnavailable
+      ? "Choose a PDF with page-level tags"
+      : noFile
+        ? toolDetails[state.tool].action
+        : isSignatureTask && count < 2
+          ? "Add one PDF and one certificate"
+          : isSignatureTask && !hasCertificatePair
+            ? "Choose one PDF and one PFX/P12"
+            : count === 0
+              ? "Choose files to continue"
+              : state.tool === "merge" && count < 2
+                ? "Add one more PDF"
+                : isComparison && count < 2
+                  ? "Add a second PDF"
+                  : toolDetails[state.tool].action;
 }
 
 function addFiles(fileList) {
@@ -1435,8 +1364,6 @@ async function runTool() {
   updateRunButton();
   setNotice(toolDetails[state.tool].requiresCertificate
     ? "Uploading the PDF and certificate for this signature request. The app does not keep a job or certificate archive."
-    : toolDetails[state.tool].noFile
-    ? "Checking OCR language data installed on the processing server."
     : "Uploading to the configured processing server. Files are held temporarily while the task runs.");
   const form = new FormData();
   state.files.forEach((file) => form.append("files", file, file.name));
@@ -1456,9 +1383,7 @@ async function runTool() {
   });
   if (workflowSteps) form.set("batch_steps", JSON.stringify(workflowSteps));
   try {
-    const response = toolDetails[state.tool].noFile
-      ? await fetch("/api/ocr-languages")
-      : await fetch(`/api/process/${state.tool === "workflow-builder" ? "batch" : state.tool}`, { method: "POST", body: form });
+    const response = await fetch(`/api/process/${state.tool === "workflow-builder" ? "batch" : state.tool}`, { method: "POST", body: form });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.detail || `The task failed with status ${response.status}.`);
@@ -1549,9 +1474,7 @@ function renderCatalog() {
       row.className = "catalog-item";
         if (toolDetails[item.id]) {
           row.type = "button";
-          row.title = item.status === "setup-required"
-            ? "Open this tool to see the required server setup."
-            : `Open ${item.name}`;
+          row.title = `Open ${item.name}`;
           row.addEventListener("click", () => {
             showCatalog(false);
             setTool(item.id);
@@ -1561,7 +1484,7 @@ function renderCatalog() {
       name.textContent = item.name;
       const status = document.createElement("span");
       status.className = `catalog-item-status ${item.status}`;
-      status.textContent = item.status === "ready" ? "Ready" : item.status === "setup-required" ? "Setup needed" : "Planned";
+      status.textContent = item.status === "ready" ? "Ready" : "Planned";
       row.append(name, status);
       list.append(row);
     });
@@ -1586,23 +1509,15 @@ async function initialize() {
     const [statusResponse, catalogResponse] = await Promise.all([fetch("/api/status"), fetch("/api/tools")]);
     if (!statusResponse.ok || !catalogResponse.ok) throw new Error("The processing server is not responding.");
     const status = await statusResponse.json();
-    state.ocrAvailable = status.ocr_available;
-    state.pdfaAvailable = status.pdfa_available;
-    state.pdfaSetupMessage = status.pdfa_setup_message || "";
     state.workflowTools = status.workflow_tools;
     state.workflowOptions = status.workflow_options;
     state.catalog = await catalogResponse.json();
     const readyCount = state.catalog.filter((tool) => tool.status === "ready").length;
-    const setupCount = state.catalog.filter((tool) => tool.status === "setup-required").length;
     const plannedCount = state.catalog.filter((tool) => tool.status === "planned").length;
-    statusLabel.textContent = status.ocr_available ? "PDF + OCR engines ready" : "PDF engine ready · OCR setup needed";
-    if (["ocr-text", "ocr-searchable", "ocr-languages", "pdfa"].includes(state.tool)) setTool(state.tool);
+    statusLabel.textContent = "PDF processing ready";
     document.querySelector("#catalog-count").textContent = `${state.catalog.length}`;
-    elements.catalogSummary.textContent = `${readyCount} ready · ${setupCount} need server setup · ${plannedCount} planned.`;
-    document.querySelector("#footer-count").textContent = `${readyCount} ready · ${setupCount} need setup · ${plannedCount} planned`;
-    document.querySelector("#ocr-nav").title = status.ocr_available
-      ? "OCR is ready on this computer."
-        : "Install Tesseract and language data on the processing server to use OCR.";
+    elements.catalogSummary.textContent = `${readyCount} ready · ${plannedCount} planned.`;
+    document.querySelector("#footer-count").textContent = `${readyCount} ready · ${plannedCount} planned`;
     renderCatalog();
     if (state.tool === "watch-folder" || state.tool === "history") renderOptions();
   } catch {

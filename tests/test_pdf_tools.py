@@ -155,43 +155,38 @@ def make_pkcs12_certificate() -> bytes:
 
 
 class PDFToolsTests(unittest.TestCase):
-    def test_catalog_lists_more_than_fifty_tools(self):
-        self.assertGreaterEqual(len(TOOL_CATALOG), 50)
+    def test_catalog_has_expected_tool_count(self):
+        self.assertEqual(len(TOOL_CATALOG), 69)
 
     def test_catalog_reports_available_tools_as_ready(self):
         from app.catalog import get_tool_catalog
 
-        catalog = get_tool_catalog(ocr_available=False)
+        catalog = get_tool_catalog()
         statuses = {tool["id"]: tool["status"] for tool in catalog}
-        setup_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
-        self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in READY_TOOL_IDS - setup_tools))
+        excluded_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
+        self.assertTrue(excluded_tools.isdisjoint(statuses))
+        self.assertTrue(excluded_tools.isdisjoint(READY_TOOL_IDS))
+        self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in READY_TOOL_IDS))
         self.assertEqual(
             BROWSER_ONLY_TOOL_IDS,
             {"watch-folder", "history", "presets", "workflow-builder"},
         )
         self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in BROWSER_ONLY_TOOL_IDS))
-        self.assertEqual(statuses["ocr-text"], "setup-required")
-        self.assertEqual(statuses["ocr-searchable"], "setup-required")
-        self.assertEqual(statuses["ocr-languages"], "setup-required")
-        self.assertEqual(statuses["pdfa"], "setup-required")
 
     def test_processing_endpoint_dispatches_every_server_tool(self):
         client = TestClient(app)
-        server_tools = READY_TOOL_IDS - BROWSER_ONLY_TOOL_IDS - {"ocr-languages"}
+        server_tools = READY_TOOL_IDS - BROWSER_ONLY_TOOL_IDS
         sample_pdf = make_pdf("sample")
         with patch("app.main.run_tool", return_value=ToolResult(b"processed", "result.pdf")) as process:
-            with patch("app.main.pdfa_setup_available", return_value=True), patch(
-                "app.main.shutil.which", return_value="tesseract"
-            ):
-                for tool in sorted(server_tools):
-                    with self.subTest(tool=tool):
-                        response = client.post(
-                            f"/api/process/{tool}",
-                            headers={"origin": "http://localhost:8000"},
-                            files={"files": ("document.pdf", sample_pdf, "application/pdf")},
-                        )
-                        self.assertEqual(response.status_code, 200, response.text)
-                        self.assertEqual(process.call_args.args[0], tool)
+            for tool in sorted(server_tools):
+                with self.subTest(tool=tool):
+                    response = client.post(
+                        f"/api/process/{tool}",
+                        headers={"origin": "http://localhost:8000"},
+                        files={"files": ("document.pdf", sample_pdf, "application/pdf")},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(process.call_args.args[0], tool)
 
     def test_processing_capacity_returns_retryable_status(self):
         with patch("app.main.processing_slots", asyncio.Semaphore(0)), patch(
@@ -278,18 +273,30 @@ class PDFToolsTests(unittest.TestCase):
             children = list(document.Root.StructTreeRoot.K.K)
             self.assertEqual([child.Pg.objgen for child in children], [page_objects[1], page_objects[0]])
 
-    def test_api_pdfa_reports_missing_server_setup(self):
+    def test_unincluded_tools_are_not_advertised_or_available(self):
         client = TestClient(app)
-        with patch("app.main.pdfa_setup_available", return_value=False), patch(
-            "app.main.pdfa_setup_error", return_value="PDF/A-2b requires Ghostscript and veraPDF."
-        ):
-            response = client.post(
-                "/api/process/pdfa",
-                headers={"origin": "http://localhost:8000"},
-                files={"files": ("source.pdf", make_pdf("sample"), "application/pdf")},
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertIn("Ghostscript and veraPDF", response.json()["detail"])
+        excluded_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
+        catalog = client.get("/api/tools")
+        status = client.get("/api/status")
+        self.assertEqual(catalog.status_code, 200)
+        self.assertEqual(status.status_code, 200)
+        catalog_ids = {tool["id"] for tool in catalog.json()}
+        ready_ids = set(status.json()["ready_tools"])
+        self.assertTrue(excluded_tools.isdisjoint(catalog_ids))
+        self.assertTrue(excluded_tools.isdisjoint(ready_ids))
+        self.assertNotIn("ocr_available", status.json())
+        self.assertNotIn("pdfa_available", status.json())
+
+        for tool in excluded_tools:
+            with self.subTest(tool=tool):
+                response = client.post(
+                    f"/api/process/{tool}",
+                    headers={"origin": "http://localhost:8000"},
+                    files={"files": ("source.pdf", make_pdf("sample"), "application/pdf")},
+                )
+                self.assertEqual(response.status_code, 404)
+
+        self.assertEqual(client.get("/api/ocr-languages").status_code, 404)
 
     def test_basic_structure_tags_preserve_pages_and_support_page_reading_order(self):
         source = make_pdf("first page", "second page")
@@ -865,12 +872,9 @@ class PDFToolsTests(unittest.TestCase):
         ):
             self.assertEqual(list_ocr_languages(), ["eng", "hin"])
 
-    def test_ocr_language_api_returns_server_configuration(self):
+    def test_ocr_language_api_is_not_exposed(self):
         client = TestClient(app)
-        with patch("app.main.list_ocr_languages", return_value=["eng", "hin"]):
-            response = client.get("/api/ocr-languages")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"languages": ["eng", "hin"]})
+        self.assertEqual(client.get("/api/ocr-languages").status_code, 404)
 
     def test_svg_conversion_and_pdf_repair(self):
         svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="blue"/></svg>'

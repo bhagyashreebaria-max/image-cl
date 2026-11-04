@@ -1,6 +1,6 @@
 # Papertrail PDF Toolkit
 
-Papertrail is an original server-side PDF workbench. Its searchable 73-item catalog includes 69 server-side operations and four browser-only utilities across page organization, conversions, optimization, OCR, accessibility checks, annotations, comparison, document security, attachments, metadata, and workflow composition. OCR and PDF/A operations require optional server-side setup; tools without that setup report that they are unavailable.
+Papertrail is an original server-side PDF workbench. Its searchable 69-item catalog includes 65 server-side operations and four browser-only utilities across page organization, conversions, optimization, accessibility checks, annotations, comparison, document security, attachments, metadata, and workflow composition.
 
 The processing API receives uploaded documents. It reads the request into memory for processing on a worker thread, closes each upload buffer when the request finishes, and returns generated output directly in the response. The application does not create a server-side job archive or intentionally persist uploaded/output documents. The browser-only history feature stores up to 50 recent job records in local browser storage; records include tool and file names, timestamps, and sizes, but not document contents or outputs. Framework upload buffering may use temporary server storage before the endpoint reads a file. Reverse proxies, hosting platforms, backups, and infrastructure logs are outside this application's retention controls and must be configured by the operator.
 
@@ -39,7 +39,7 @@ PAPERTRAIL_ALLOWED_HOSTS=pdf.example.com
 PAPERTRAIL_ALLOWED_ORIGINS=https://pdf.example.com
 ```
 
-Configure the reverse proxy's request-body limit slightly above 82 MiB to account for multipart framing, and avoid logging request bodies. Protect the service with authentication, rate limits, and appropriate storage/temporary-directory policies. The `/health` endpoint checks that the worker is ready and can be used for a deployment health check. `PAPERTRAIL_WORKER_STARTUP_TIMEOUT` is a positive Go duration; the worker's port must be available locally. `PAPERTRAIL_ALLOWED_HOSTS` is enforced by the Go API; the private worker is restricted to loopback hosts. Other `PAPERTRAIL_*` processing settings (including concurrency and optional OCR/PDF/A setup) are inherited by the worker.
+Configure the reverse proxy's request-body limit slightly above 82 MiB to account for multipart framing, and avoid logging request bodies. Protect the service with authentication, rate limits, and appropriate storage/temporary-directory policies. The `/health` endpoint checks that the worker is ready and can be used for a deployment health check. `PAPERTRAIL_WORKER_STARTUP_TIMEOUT` is a positive Go duration; the worker's port must be available locally. `PAPERTRAIL_ALLOWED_HOSTS` is enforced by the Go API; the private worker is restricted to loopback hosts. Other `PAPERTRAIL_*` processing settings (including concurrency settings) are inherited by the worker.
 
 Each server process accepts at most two PDF-processing or inspection jobs concurrently by default. Set `PAPERTRAIL_MAX_CONCURRENT_JOBS` to a value from 1 to 64 to tune that per-process limit for the host's available memory and CPU. Requests wait up to 30 seconds for a slot, then receive HTTP 503 with `Retry-After`. An operation accepts at most 100 uploaded files. Every raster-based operation is capped at 8 million pixels per page and 40 million pixels per operation; image-to-PDF is limited to 100 image pages as well. These limits bound common processing workloads but do not make arbitrary uploads safe to process without authentication, quotas, and infrastructure-level resource limits. A multi-worker or multi-replica deployment multiplies the configured concurrency; size it against measured peak memory rather than request count alone.
 
@@ -47,18 +47,11 @@ This repository is a synchronous, stateless processing service, not a globally d
 
 The browser calls relative `/api/...` paths, so the frontend and Go API must be served from the same origin. If the interface shows a fetch error, open `/health` on that same host first; it should return `{"status":"ok"}` when the worker is ready. A static repository preview is not a running processing server. For local use, start the Go API with `go run .` and open `http://127.0.0.1:8000`. For a hosted instance, deploy the Go API and worker together and set the allowed host/origin variables above. For Python processor development without the Go API, `python -m app` still starts the processor API directly on port 8000 by default; do not expose the worker port in a Go-backed deployment.
 
-PDF/A-2b conversion requires Ghostscript, veraPDF, an RGB ICC profile, and an output-condition name on the processing server. Install and configure those tools in the server environment; the app does not download or provision them. Set `PAPERTRAIL_GHOSTSCRIPT` and `PAPERTRAIL_VERAPDF` if their executables are not discoverable on `PATH`, and set `PAPERTRAIL_PDFA_ICC_PROFILE` to the ICC profile path and `PAPERTRAIL_PDFA_OUTPUT_CONDITION` to its output-condition identifier. Conversion uses Ghostscript's strict compatibility policy and only returns a document after veraPDF reports PDF/A-2b compliance. Otherwise the feature reports setup-required or conversion failure.
-
-## OCR setup
-
-OCR uses the Tesseract executable installed on the processing server, plus its language data. English is the default; Hindi and English+Hindi are selectable when the corresponding language packs are installed. The app can list installed language packs but does not install them. Without Tesseract, the OCR tools report that setup is required and the rest of the toolkit remains available. OCR can export recognized text to `.txt` or create a raster-backed searchable PDF, with a 100-page per-operation cap for searchable output.
-
 ## Current tools and limitations
 
 - **Page organization:** merge, split into page groups, rotate, reorder, extract pages, delete pages, duplicate selected pages, reverse page order, insert blank pages, set PDF page labels, crop all pages by a margin, and scale pages to A4, Letter, or Legal.
 - **Conversions:** PNG/JPEG/BMP/TIFF images to PDF, PDF pages to PNG files in a ZIP or raster-image PowerPoint slides, PDF text/Markdown/DOCX/XLSX/accessibility-text export, UTF-8 text to PDF, basic Markdown-to-PDF, text-focused HTML-to-PDF, EPUB-to-PDF, text-focused DOCX/XLSX/PPTX-to-PDF, and SVG-to-PDF. Raster exports are limited to 8 million pixels per page and 40 million rendered pixels per request.
-- **Optimization and accessibility:** PDF structural compression, embedded-image recompression, linearize for progressive web viewing, validate pages with the PDF parser, recover and rewrite damaged PDFs, grayscale/deskew/enhance scanned pages, remove visually duplicate pages, and report basic PDF accessibility indicators. PDF/A-2b conversion is available only when the server has Ghostscript, veraPDF, an RGB ICC profile, and an output condition configured; a passing veraPDF report is required before output is returned.
-- **OCR:** export recognized text, create searchable PDFs, and list installed Tesseract language packs on the processing server. OCR tools are setup-required until Tesseract is detected.
+- **Optimization and accessibility:** PDF structural compression, embedded-image recompression, linearize for progressive web viewing, validate pages with the PDF parser, recover and rewrite damaged PDFs, grayscale/deskew/enhance scanned pages, remove visually duplicate pages, and report basic PDF accessibility indicators.
 - **Structure and reading order:** add basic page-level structure tags to PDFs with selectable text and set the order of those page elements. Tagging rejects existing structure trees and does not infer headings, describe images, or produce PDF/UA-conforming documents. Reading-order editing only supports PDFs created by this basic tagging operation; it changes logical reading order without moving visible pages.
 - **Annotations:** centered text watermark, positioned text stamps, headers/footers with optional page counts, page numbers, exact-text highlighting and redaction, comments, and rectangle drawing.
 - **Comparison:** compare extracted text, generate a side-by-side page PDF, or create a thresholded visual-difference PDF. Each comparison requires exactly two input PDFs, in original-then-revised order.
@@ -72,7 +65,7 @@ OCR uses the Tesseract executable installed on the processing server, plus its l
 
 Page rasterization in grayscale intentionally removes selectable text/vector content; duplicate detection may remove pages with identical visual output even if their underlying text differs. Page resizing may lose annotations, forms, and document structure. Operations that rewrite a PDF can invalidate existing digital signatures. Compression is not guaranteed to reduce file size. The application keeps inputs and outputs in process memory after the upload buffer is read and returns outputs directly; it does not provide durable storage, authentication, user accounts, or a public hosted service.
 
-Deskew and scan enhancement rasterize pages at 120 DPI, so selectable text, vector detail, and form fields are not preserved. Scan processing is limited to 100 pages, 8 million pixels per page, and 40 million rendered pixels per request. OCR is limited to 100 pages and the same raster pixel limits.
+Deskew and scan enhancement rasterize pages at 120 DPI, so selectable text, vector detail, and form fields are not preserved. Scan processing is limited to 100 pages, 8 million pixels per page, and 40 million rendered pixels per request.
 
 Text highlighting and redaction only find exact, selectable text and may not cover text embedded in images. Review redacted output before sharing. PDF permission flags are enforced by reader applications and are not strong access control. Comparison reports render pages at 72 DPI; visual differences are thresholded and can omit subtle changes.
 
@@ -90,10 +83,6 @@ Word and spreadsheet conversion supports modern `.docx` and `.xlsx` files only a
 
 PowerPoint-to-PDF extracts slide text and table values into a text-focused PDF; it does not render the original slide layout, images, charts, fonts, or animations. PDF-to-PowerPoint creates one non-editable 96-DPI page image per slide, limited to 100 pages, 8 million pixels per page, and 40 million rendered pixels per request.
 
-## Setup-required tools
-
-The catalog marks tools as setup-required when optional processing-server dependencies are unavailable. OCR requires Tesseract and language data. PDF/A-2b conversion requires Ghostscript, veraPDF, an RGB ICC profile, and a configured output condition; every output must pass veraPDF validation. Structure tagging and page-level reading-order editing are implemented with the limitations described above and are not PDF/UA conformance features.
-
 ## Tests
 
 ```powershell
@@ -101,4 +90,4 @@ go test ./...
 python -m unittest discover -s tests -v
 ```
 
-The Go tests cover API discovery, internal worker dispatch, health/readiness, request limits, and host/origin restrictions. The Python test suite covers implemented PDF operations, API dispatch for every server-side catalog tool, API upload handling, digital signing and certification, invalid page selections, catalog status, browser-only tool endpoint protection, raster workload limits, and the missing-Tesseract error path.
+The Go tests cover API discovery, internal worker dispatch, health/readiness, request limits, and host/origin restrictions. The Python test suite covers implemented PDF operations, API dispatch for every server-side catalog tool, API upload handling, digital signing and certification, invalid page selections, catalog status and excluded-tool discovery, browser-only tool endpoint protection, and raster workload limits.

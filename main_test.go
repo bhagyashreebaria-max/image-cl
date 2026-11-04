@@ -32,6 +32,21 @@ func TestAPIIndexDocumentsUnifiedEndpoints(t *testing.T) {
 			t.Errorf("API index does not include %q", expected)
 		}
 	}
+	if strings.Contains(response.Body.String(), "/api/ocr-languages") {
+		t.Error("API index still includes the removed OCR languages endpoint")
+	}
+}
+
+func TestRemovedOCRLanguagesEndpointIsNotAvailable(t *testing.T) {
+	workerURL, _ := url.Parse("http://127.0.0.1:8001")
+	response := httptest.NewRecorder()
+	newAPIServer(workerURL, testOrigin, testAllowedHosts).handler().ServeHTTP(
+		response,
+		publicRequest(http.MethodGet, "/api/ocr-languages", nil),
+	)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/ocr-languages returned %d, want 404", response.Code)
+	}
 }
 
 func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {

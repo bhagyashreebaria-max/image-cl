@@ -107,7 +107,6 @@ func (g *apiServer) handler() http.Handler {
 	mux.Handle("/api", methodOnly(http.MethodGet, http.HandlerFunc(g.apiIndex)))
 	mux.Handle("/api/tools", methodOnly(http.MethodGet, http.HandlerFunc(g.tools)))
 	mux.Handle("/api/status", methodOnly(http.MethodGet, http.HandlerFunc(g.status)))
-	mux.Handle("/api/ocr-languages", methodOnly(http.MethodGet, http.HandlerFunc(g.ocrLanguages)))
 	mux.Handle("/api/inspect", methodOnly(http.MethodPost, http.HandlerFunc(g.inspect)))
 	mux.Handle("/api/process/{tool}", methodOnly(http.MethodPost, http.HandlerFunc(g.process)))
 	mux.Handle("/api/", http.HandlerFunc(g.notFound))
@@ -180,7 +179,7 @@ func (g *apiServer) limitAPIRequests(next http.Handler) http.Handler {
 func (g *apiServer) apiIndex(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":        "Papertrail PDF API",
-		"description": "A single Go API for the PDF toolkit. Discover operation availability and optional server setup at /api/tools.",
+		"description": "A single Go API for the PDF toolkit. Discover available operations and processing capabilities at /api/tools.",
 		"endpoints": map[string]any{
 			"tools": map[string]string{
 				"method":      http.MethodGet,
@@ -202,11 +201,6 @@ func (g *apiServer) apiIndex(w http.ResponseWriter, _ *http.Request) {
 				"path":        "/api/inspect",
 				"description": "Inspect a PDF using multipart/form-data with a single file field.",
 			},
-			"ocr_languages": map[string]string{
-				"method":      http.MethodGet,
-				"path":        "/api/ocr-languages",
-				"description": "List OCR languages installed on the processing worker.",
-			},
 		},
 		"health":            "/health",
 		"max_input_bytes":   maxInputBytes,
@@ -221,10 +215,6 @@ func (g *apiServer) tools(w http.ResponseWriter, r *http.Request) {
 
 func (g *apiServer) status(w http.ResponseWriter, r *http.Request) {
 	g.workerJSON(w, r, "/api/status")
-}
-
-func (g *apiServer) ocrLanguages(w http.ResponseWriter, r *http.Request) {
-	g.workerJSON(w, r, "/api/ocr-languages")
 }
 
 func (g *apiServer) inspect(w http.ResponseWriter, r *http.Request) {

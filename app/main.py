@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import pymupdf as fitz
@@ -21,10 +20,7 @@ from app.pdf_tools import (
     MAX_UPLOAD_BYTES,
     ToolError,
     form_fields,
-    list_ocr_languages,
     open_pdf,
-    pdfa_setup_available,
-    pdfa_setup_error,
     reading_order_entry_count,
     run_tool,
 )
@@ -100,20 +96,9 @@ async def health_check():
 
 @app.get("/api/status")
 async def get_status():
-    ocr_available = shutil.which("tesseract") is not None
-    pdfa_setup_message = pdfa_setup_error()
-    pdfa_available = pdfa_setup_message is None
-    ready_tools = set(READY_TOOL_IDS)
-    if not ocr_available:
-        ready_tools.difference_update({"ocr-text", "ocr-searchable", "ocr-languages"})
-    if not pdfa_available:
-        ready_tools.discard("pdfa")
     return {
         "server_processing": True,
-        "ocr_available": ocr_available,
-        "pdfa_available": pdfa_available,
-        "pdfa_setup_message": pdfa_setup_message,
-        "ready_tools": sorted(ready_tools),
+        "ready_tools": sorted(READY_TOOL_IDS),
         "workflow_tools": sorted(BATCH_TOOLS),
         "workflow_options": {tool: sorted(options) for tool, options in BATCH_OPTION_KEYS.items()},
         "max_upload_bytes": MAX_UPLOAD_BYTES,
@@ -123,20 +108,7 @@ async def get_status():
 
 @app.get("/api/tools")
 async def get_tools():
-    pdfa_available = pdfa_setup_available()
-    return get_tool_catalog(
-        ocr_available=shutil.which("tesseract") is not None,
-        pdfa_available=pdfa_available,
-    )
-
-
-@app.get("/api/ocr-languages")
-async def get_ocr_languages():
-    try:
-        languages = await run_in_threadpool(list_ocr_languages)
-    except ToolError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
-    return {"languages": languages}
+    return get_tool_catalog()
 
 
 def inspect_pdf_data(filename: str, data: bytes) -> dict[str, object]:
@@ -219,8 +191,6 @@ async def process_pdf(
         raise HTTPException(status_code=404, detail="That tool is not available yet.")
     if len(files) > MAX_INPUT_FILES:
         raise HTTPException(status_code=413, detail=f"An operation can include at most {MAX_INPUT_FILES} files.")
-    if tool == "pdfa" and not pdfa_setup_available():
-        raise HTTPException(status_code=503, detail=pdfa_setup_error())
     payloads: list[tuple[str, bytes]] = []
     total_size = 0
     try:
