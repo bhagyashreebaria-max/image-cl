@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import difflib
 import json
+import os
 from html import escape
 from html.parser import HTMLParser
 import posixpath
@@ -12,9 +13,10 @@ import re
 import shutil
 import subprocess
 import textwrap
+import tempfile
 import zipfile
 from xml.etree import ElementTree
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from typing import Sequence
 from urllib.parse import unquote, urlsplit
 
@@ -1030,6 +1032,269 @@ def pdfua_accessibility_report(filename: str, data: bytes) -> ToolResult:
     )
 
 
+def _pdfa_configuration() -> tuple[str | None, str | None, Path | None, str | None]:
+    configured_ghostscript = os.environ.get("PAPERTRAIL_GHOSTSCRIPT", "").strip()
+    if configured_ghostscript:
+        ghostscript = str(Path(configured_ghostscript)) if Path(configured_ghostscript).is_file() else shutil.which(configured_ghostscript)
+    else:
+        ghostscript = next(
+            (path for command in ("gswin64c", "gswin32c", "gs") if (path := shutil.which(command))),
+            None,
+        )
+    configured_verapdf = os.environ.get("PAPERTRAIL_VERAPDF", "").strip()
+    verapdf = shutil.which(configured_verapdf or "verapdf")
+    profile_value = os.environ.get("PAPERTRAIL_PDFA_ICC_PROFILE", "").strip()
+    profile = Path(profile_value).expanduser() if profile_value else None
+    condition = os.environ.get("PAPERTRAIL_PDFA_OUTPUT_CONDITION", "").strip() or None
+    if profile is not None and not profile.is_file():
+        profile = None
+    if profile is not None:
+        try:
+            with profile.open("rb") as stream:
+                header = stream.read(128)
+                profile_size = int.from_bytes(header[:4], "big") if len(header) >= 4 else 0
+                if (
+                    len(header) < 128
+                    or profile_size < 128
+                    or profile_size > profile.stat().st_size
+                    or header[16:20] != b"RGB "
+                    or header[36:40] != b"acsp"
+                ):
+                    profile = None
+        except OSError:
+            profile = None
+    return ghostscript, verapdf, profile, condition
+
+
+def pdfa_setup_error() -> str | None:
+    ghostscript, verapdf, profile, condition = _pdfa_configuration()
+    missing = []
+    if not ghostscript:
+        missing.append("Ghostscript")
+    if not verapdf:
+        missing.append("veraPDF")
+    if profile is None:
+        missing.append("a readable RGB ICC profile configured with PAPERTRAIL_PDFA_ICC_PROFILE")
+    if not condition:
+        missing.append("PAPERTRAIL_PDFA_OUTPUT_CONDITION")
+    if missing:
+        return "PDF/A-2b requires " + ", ".join(missing) + " on the processing server."
+    return None
+
+
+def pdfa_setup_available() -> bool:
+    return pdfa_setup_error() is None
+
+
+def _postscript_literal(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise ToolError("The PDF/A output condition must be a single line.")
+    return "(" + value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") + ")"
+
+
+def convert_pdfa(filename: str, data: bytes) -> ToolResult:
+    setup_error = pdfa_setup_error()
+    if setup_error:
+        raise ToolError(setup_error, status_code=503)
+    ghostscript, verapdf, profile, condition = _pdfa_configuration()
+    if not ghostscript or not verapdf or profile is None or condition is None:
+        raise ToolError("PDF/A conversion setup is incomplete on the processing server.", status_code=503)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="papertrail-pdfa-") as directory:
+            work_dir = Path(directory)
+            input_path = work_dir / "input.pdf"
+            output_path = work_dir / "output.pdf"
+            definition_path = work_dir / "PDFA_def.ps"
+            input_path.write_bytes(data)
+            profile_path = profile.resolve().as_posix()
+            definition = (
+                "%!\n"
+                f"/ICCProfile {_postscript_literal(profile_path)} def\n"
+                "[/_objdef {icc_PDFA} /type /stream /OBJ pdfmark\n"
+                "[{icc_PDFA} << /N 3 >> /PUT pdfmark\n"
+                "[{icc_PDFA} ICCProfile (r) file /PUT pdfmark\n"
+                "[/_objdef {OutputIntent_PDFA} /type /dict /OBJ pdfmark\n"
+                "[{OutputIntent_PDFA} << /Type /OutputIntent /S /GTS_PDFA1 "
+                f"/DestOutputProfile {{icc_PDFA}} /OutputConditionIdentifier {_postscript_literal(condition)} "
+                f"/Info {_postscript_literal(condition)} >> /PUT pdfmark\n"
+                "[{Catalog} << /OutputIntents [ {OutputIntent_PDFA} ] >> /PUT pdfmark\n"
+            )
+            definition_path.write_text(definition, encoding="ascii")
+            try:
+                conversion = subprocess.run(
+                    [
+                        ghostscript,
+                        "-dSAFER",
+                        "-dBATCH",
+                        "-dNOPAUSE",
+                        "-dPDFA=2",
+                        "-dPDFACompatibilityPolicy=2",
+                        "-sColorConversionStrategy=RGB",
+                        "-sDEVICE=pdfwrite",
+                        f"-sOutputFile={output_path}",
+                        f"--permit-file-read={profile.resolve()}",
+                        str(definition_path),
+                        str(input_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise ToolError("Ghostscript took too long to convert this PDF to PDF/A-2b.", status_code=504) from error
+            if conversion.returncode or not output_path.is_file():
+                raise ToolError("Ghostscript could not convert this document to PDF/A-2b with the configured profile.")
+            if output_path.stat().st_size > MAX_UPLOAD_BYTES:
+                raise ToolError("The PDF/A output exceeded the 80 MiB server limit.", status_code=413)
+
+            try:
+                validation = subprocess.run(
+                    [
+                        verapdf,
+                        "-f",
+                        "2b",
+                        "--format",
+                        "xml",
+                        "--maxfailures",
+                        "100",
+                        "--maxfailuresdisplayed",
+                        "10",
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise ToolError("veraPDF took too long to validate this document.", status_code=504) from error
+            try:
+                report = ElementTree.fromstring(validation.stdout)
+            except ElementTree.ParseError as error:
+                raise ToolError("veraPDF did not return a readable PDF/A validation report.") from error
+            reports = report.findall(".//validationReport")
+            if validation.returncode or len(reports) != 1 or reports[0].get("isCompliant") != "true":
+                raise ToolError("The converted output did not pass veraPDF's PDF/A-2b conformance validation.")
+            result = output_path.read_bytes()
+    except OSError as error:
+        raise ToolError(f"PDF/A conversion could not use its temporary processing files: {error}") from error
+    return ToolResult(result, f"{safe_stem(filename)}-pdfa-2b.pdf", input_bytes=len(data))
+
+
+def _page_structure_elements(pdf: pikepdf.Pdf) -> list[pikepdf.Object] | None:
+    structure_root = pdf.Root.get("/StructTreeRoot")
+    if not isinstance(structure_root, pikepdf.Dictionary):
+        return None
+    document_element = structure_root.get("/K")
+    if not isinstance(document_element, pikepdf.Dictionary) or document_element.get("/S") != pikepdf.Name.Document:
+        return None
+    children = document_element.get("/K")
+    if not isinstance(children, pikepdf.Array) or not children:
+        return None
+    if any(
+        not isinstance(child, pikepdf.Dictionary)
+        or child.get("/S") != pikepdf.Name.P
+        or child.get("/K") != 0
+        or child.get("/Pg") is None
+        for child in children
+    ):
+        return None
+    return list(children)
+
+
+def reading_order_entry_count(filename: str, data: bytes) -> int:
+    try:
+        with pikepdf.Pdf.open(BytesIO(data)) as pdf:
+            elements = _page_structure_elements(pdf)
+            return len(elements) if elements is not None else 0
+    except pikepdf.PdfError as error:
+        raise ToolError("The PDF structure could not be inspected.") from error
+
+
+def tag_pdf_structure(filename: str, data: bytes, language: str) -> ToolResult:
+    if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language):
+        raise ToolError("Enter a valid document language tag such as en-US or hi.")
+    document = open_pdf(data, filename)
+    try:
+        if not document.page_count:
+            raise ToolError("The PDF has no pages to tag.")
+        page_text = [page.get_text("text").strip() for page in document]
+        if any(not text for text in page_text):
+            raise ToolError("Basic tagging needs selectable text on every page. OCR scanned pages before tagging.")
+    finally:
+        document.close()
+
+    try:
+        with pikepdf.Pdf.open(BytesIO(data)) as pdf:
+            if pdf.Root.get("/StructTreeRoot") is not None or any(
+                page.obj.get("/StructParents") is not None for page in pdf.pages
+            ):
+                raise ToolError("This basic tagging tool does not replace existing document structure tags.")
+            structure_root = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.StructTreeRoot))
+            pdf.Root["/StructTreeRoot"] = structure_root
+            document_element = pdf.make_indirect(pikepdf.Dictionary(
+                Type=pikepdf.Name.StructElem,
+                S=pikepdf.Name.Document,
+                P=structure_root,
+                K=pikepdf.Array(),
+            ))
+            structure_root["/K"] = document_element
+            page_elements = pikepdf.Array()
+            parent_numbers = pikepdf.Array()
+            for index, (page, text) in enumerate(zip(pdf.pages, page_text, strict=True)):
+                page_object = page.obj
+                contents = page_object.get("/Contents")
+                streams = list(contents) if isinstance(contents, pikepdf.Array) else [contents]
+                content_bytes = b"\n".join(stream.read_bytes() for stream in streams if stream is not None)
+                actual_text = text.encode("utf-16-be").hex().upper()
+                marked_content = (
+                    f"/P << /MCID 0 /ActualText <FEFF{actual_text}> >> BDC\n".encode("ascii")
+                    + content_bytes
+                    + b"\nEMC\n"
+                )
+                page_object["/Contents"] = pdf.make_stream(marked_content)
+                page_object["/StructParents"] = index
+                element = pdf.make_indirect(pikepdf.Dictionary(
+                    Type=pikepdf.Name.StructElem,
+                    S=pikepdf.Name.P,
+                    P=document_element,
+                    Pg=page_object,
+                    K=0,
+                ))
+                page_elements.append(element)
+                parent_numbers.extend([index, pikepdf.Array([element])])
+            document_element["/K"] = page_elements
+            structure_root["/ParentTree"] = pdf.make_indirect(pikepdf.Dictionary(Nums=parent_numbers))
+            structure_root["/ParentTreeNextKey"] = len(page_elements)
+            pdf.Root["/MarkInfo"] = pikepdf.Dictionary(Marked=True)
+            pdf.Root["/Lang"] = pikepdf.String(language)
+            output = BytesIO()
+            pdf.save(output, min_version="1.7")
+    except pikepdf.PdfError as error:
+        raise ToolError("The PDF could not be given basic page-level structure tags.") from error
+    return ToolResult(output.getvalue(), f"{safe_stem(filename)}-tagged.pdf", input_bytes=len(data))
+
+
+def set_reading_order(filename: str, data: bytes, order: str) -> ToolResult:
+    try:
+        with pikepdf.Pdf.open(BytesIO(data)) as pdf:
+            elements = _page_structure_elements(pdf)
+            if elements is None:
+                raise ToolError("Reading-order editing requires a PDF tagged by the basic page-level structure tool.")
+            indexes = parse_page_order(order, len(elements))
+            document_element = pdf.Root.StructTreeRoot.K
+            document_element["/K"] = pikepdf.Array([elements[index] for index in indexes])
+            output = BytesIO()
+            pdf.save(output, min_version="1.7")
+    except pikepdf.PdfError as error:
+        raise ToolError("The PDF reading order could not be updated.") from error
+    return ToolResult(output.getvalue(), f"{safe_stem(filename)}-reading-order.pdf", input_bytes=len(data))
+
+
 def grayscale_pdf(filename: str, data: bytes, dpi: int) -> ToolResult:
     if dpi not in {72, 100, 120, 150}:
         raise ToolError("Choose a grayscale rendering resolution of 72, 100, 120, or 150 DPI.")
@@ -1855,6 +2120,8 @@ def run_tool(
     rotation: int = 90,
     order: str = "",
     language: str = "eng",
+    document_language: str = "en-US",
+    structure_order: str = "",
     prefix: str = "",
     label_style: str = "D",
     first_number: int = 1,
@@ -2008,6 +2275,18 @@ def run_tool(
         if len(files) != 1:
             raise ToolError("Choose exactly one PDF for the accessibility check.")
         return pdfua_accessibility_report(files[0][0], files[0][1])
+    if tool == "pdfa":
+        if len(files) != 1:
+            raise ToolError("Choose exactly one PDF to convert to PDF/A.")
+        return convert_pdfa(files[0][0], files[0][1])
+    if tool == "tag-pdf":
+        if len(files) != 1:
+            raise ToolError("Choose exactly one PDF to add basic structure tags to.")
+        return tag_pdf_structure(files[0][0], files[0][1], document_language)
+    if tool == "reading-order":
+        if len(files) != 1:
+            raise ToolError("Choose exactly one tagged PDF to set the reading order for.")
+        return set_reading_order(files[0][0], files[0][1], structure_order)
     if tool == "grayscale":
         if len(files) != 1:
             raise ToolError("Choose exactly one PDF to convert to grayscale.")

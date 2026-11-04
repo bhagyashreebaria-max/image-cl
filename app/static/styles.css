@@ -212,6 +212,14 @@ h1 em, .catalog-header h2 em { color: var(--blue); font-style: normal; }
 .workflow-step textarea { width: 100%; min-height: 58px; resize: vertical; font-family: Consolas, "Courier New", monospace; }
 .workflow-preset-row { width: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 15px; padding: 9px 0; border-bottom: 1px solid #e6eaef; color: #536176; font-size: 11px; }
 .workflow-preset-row span { flex: 1 1 180px; }
+.watch-folder-controls { width: 100%; display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.watch-folder-status { width: 100%; margin: 0; color: #536176; font-size: 10px; line-height: 1.5; }
+.job-history-list, .watch-folder-results { width: 100%; display: grid; gap: 8px; margin: 4px 0 0; padding: 0; list-style: none; }
+.job-history-entry { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid #e6eaef; color: #536176; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.job-history-entry strong { color: var(--navy); font-size: 11px; }
+.job-history-entry span:last-child { color: #8490a0; font-size: 9px; }
+.watch-folder-results li { padding: 8px 0; border-bottom: 1px solid #e6eaef; font-size: 10px; overflow-wrap: anywhere; }
+.watch-folder-results a { color: var(--blue); }
 .workflow-step button:disabled, .workflow-preset-controls button:disabled { opacity: .5; cursor: not-allowed; }
 .run-row { display: flex; align-items: center; gap: 13px; margin-top: 19px; }
 .run-button { min-width: 208px; min-height: 42px; display: inline-flex; align-items: center; justify-content: space-between; gap: 22px; padding: 0 14px; border: 0; border-radius: 7px; background: var(--blue); color: #fff; font-size: 12px; font-weight: 710; cursor: pointer; transition: background-color .16s ease, transform .16s ease; }

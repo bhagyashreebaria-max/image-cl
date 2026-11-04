@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.catalog import READY_TOOL_IDS, get_tool_catalog
+from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, get_tool_catalog
 from app.pdf_tools import (
     BATCH_OPTION_KEYS,
     BATCH_TOOLS,
@@ -21,6 +21,9 @@ from app.pdf_tools import (
     form_fields,
     list_ocr_languages,
     open_pdf,
+    pdfa_setup_available,
+    pdfa_setup_error,
+    reading_order_entry_count,
     run_tool,
 )
 
@@ -67,12 +70,19 @@ async def health_check():
 @app.get("/api/status")
 async def get_status():
     ocr_available = shutil.which("tesseract") is not None
+    pdfa_setup_message = pdfa_setup_error()
+    pdfa_available = pdfa_setup_message is None
+    ready_tools = set(READY_TOOL_IDS)
+    if not ocr_available:
+        ready_tools.difference_update({"ocr-text", "ocr-searchable", "ocr-languages"})
+    if not pdfa_available:
+        ready_tools.discard("pdfa")
     return {
         "server_processing": True,
         "ocr_available": ocr_available,
-        "ready_tools": sorted(
-            READY_TOOL_IDS if ocr_available else READY_TOOL_IDS - {"ocr-text", "ocr-searchable", "ocr-languages"}
-        ),
+        "pdfa_available": pdfa_available,
+        "pdfa_setup_message": pdfa_setup_message,
+        "ready_tools": sorted(ready_tools),
         "workflow_tools": sorted(BATCH_TOOLS),
         "workflow_options": {tool: sorted(options) for tool, options in BATCH_OPTION_KEYS.items()},
         "max_upload_bytes": MAX_UPLOAD_BYTES,
@@ -81,7 +91,11 @@ async def get_status():
 
 @app.get("/api/tools")
 async def get_tools():
-    return get_tool_catalog(ocr_available=shutil.which("tesseract") is not None)
+    pdfa_available = pdfa_setup_available()
+    return get_tool_catalog(
+        ocr_available=shutil.which("tesseract") is not None,
+        pdfa_available=pdfa_available,
+    )
 
 
 @app.get("/api/ocr-languages")
@@ -110,7 +124,12 @@ async def inspect_pdf(file: UploadFile = File(...)):
             {"name": widget.field_name, "type": widget.field_type_string}
             for widget in form_fields(document)
         ]
-        return {"page_count": document.page_count, "fields": fields}
+        structure_count = reading_order_entry_count(file.filename or "document.pdf", data)
+        return {
+            "page_count": document.page_count,
+            "fields": fields,
+            "reading_order_count": structure_count,
+        }
     finally:
         document.close()
 
@@ -123,6 +142,8 @@ async def process_pdf(
     rotation: int = Form(90),
     order: str = Form(""),
     language: str = Form("eng"),
+    document_language: str = Form("en-US"),
+    structure_order: str = Form(""),
     prefix: str = Form(""),
     label_style: str = Form("D"),
     first_number: int = Form(1),
@@ -155,8 +176,10 @@ async def process_pdf(
     signature_field: str = Form("Signature1"),
     signature_reason: str = Form(""),
 ):
-    if tool not in READY_TOOL_IDS:
+    if tool not in READY_TOOL_IDS or tool in BROWSER_ONLY_TOOL_IDS:
         raise HTTPException(status_code=404, detail="That tool is not available yet.")
+    if tool == "pdfa" and not pdfa_setup_available():
+        raise HTTPException(status_code=503, detail=pdfa_setup_error())
     payloads: list[tuple[str, bytes]] = []
     total_size = 0
     try:
@@ -180,6 +203,8 @@ async def process_pdf(
             rotation=rotation,
             order=order,
             language=language,
+            document_language=document_language,
+            structure_order=structure_order,
             prefix=prefix,
             label_style=label_style,
             first_number=first_number,

@@ -31,7 +31,7 @@ TOOL_CATALOG = [
     ("linearize", "Optimize for fast web view", "Optimization", "planned"),
     ("repair", "Repair a damaged PDF", "Optimization", "planned"),
     ("validate", "Validate PDF structure", "Optimization", "planned"),
-    ("pdfa", "Convert to PDF/A", "Optimization", "planned"),
+    ("pdfa", "Convert to PDF/A-2b", "Optimization", "planned"),
     ("pdfua", "Check PDF/UA accessibility", "Optimization", "planned"),
     ("grayscale", "Convert to grayscale", "Optimization", "planned"),
     ("deskew", "Deskew scanned pages", "Optimization", "planned"),
@@ -41,8 +41,8 @@ TOOL_CATALOG = [
     ("ocr-searchable", "Create searchable PDF", "OCR & accessibility", "planned"),
     ("ocr-languages", "View installed OCR languages", "OCR & accessibility", "planned"),
     ("accessible-text", "Export accessible text", "OCR & accessibility", "planned"),
-    ("tag-pdf", "Add document structure tags", "OCR & accessibility", "planned"),
-    ("reading-order", "Set reading order", "OCR & accessibility", "planned"),
+    ("tag-pdf", "Add basic structure tags", "OCR & accessibility", "planned"),
+    ("reading-order", "Set tagged page reading order", "OCR & accessibility", "planned"),
     ("watermark", "Add a watermark", "Annotations", "planned"),
     ("stamp", "Stamp pages", "Annotations", "planned"),
     ("headers-footers", "Add headers and footers", "Annotations", "planned"),
@@ -108,6 +108,7 @@ READY_TOOL_IDS = {
     "compress-images",
     "linearize",
     "validate",
+    "pdfa",
     "pdfua",
     "deskew",
     "enhance-scan",
@@ -143,15 +144,23 @@ READY_TOOL_IDS = {
     "pdf-to-slides",
     "presets",
     "workflow-builder",
+    "watch-folder",
+    "history",
+    "tag-pdf",
+    "reading-order",
 }
 
+BROWSER_ONLY_TOOL_IDS = {"watch-folder", "history"}
 
-def get_tool_catalog(*, ocr_available: bool) -> list[dict[str, str]]:
+
+def get_tool_catalog(*, ocr_available: bool, pdfa_available: bool = False) -> list[dict[str, str]]:
     catalog = []
     for tool_id, name, category, status in TOOL_CATALOG:
         if tool_id in READY_TOOL_IDS:
             status = "ready"
         if tool_id in {"ocr-text", "ocr-searchable", "ocr-languages"} and not ocr_available:
+            status = "setup-required"
+        if tool_id == "pdfa" and not pdfa_available:
             status = "setup-required"
         catalog.append({"id": tool_id, "name": name, "category": category, "status": status})
     return catalog

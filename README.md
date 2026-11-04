@@ -1,8 +1,8 @@
 # Papertrail PDF Toolkit
 
-Papertrail is an original server-side PDF workbench. It currently provides 68 implemented operations across page organization, conversions, optimization, OCR, accessibility checks, annotations, comparison, document security, attachments, metadata, and workflow composition. The searchable 73-item tool library distinguishes working tools from the remaining roadmap; planned tools are not presented as working features.
+Papertrail is an original server-side PDF workbench. Its searchable 73-item catalog includes 71 server-side operations and two browser-only utilities across page organization, conversions, optimization, OCR, accessibility checks, annotations, comparison, document security, attachments, metadata, and workflow composition. OCR and PDF/A operations require optional server-side setup; tools without that setup report that they are unavailable.
 
-The processing API receives uploaded documents. It reads the request into memory for processing on a worker thread, closes each upload buffer when the request finishes, and streams the generated output back in the response. The application does not create a job archive or intentionally persist uploaded/output documents. Framework upload buffering may use temporary server storage before the endpoint reads a file. Reverse proxies, hosting platforms, backups, and infrastructure logs are outside this application's retention controls and must be configured by the operator.
+The processing API receives uploaded documents. It reads the request into memory for processing on a worker thread, closes each upload buffer when the request finishes, and streams the generated output back in the response. The application does not create a server-side job archive or intentionally persist uploaded/output documents. The browser-only history feature stores up to 50 recent job records in local browser storage; records include tool and file names, timestamps, and sizes, but not document contents or outputs. Framework upload buffering may use temporary server storage before the endpoint reads a file. Reverse proxies, hosting platforms, backups, and infrastructure logs are outside this application's retention controls and must be configured by the operator.
 
 ## Run locally
 
@@ -34,6 +34,8 @@ Configure the reverse proxy's request-body limit slightly above 80 MiB to accoun
 
 The browser calls relative `/api/...` paths, so the frontend and processing API must be served from the same origin. If the interface shows a fetch error, open `/health` on that same host first; it should return `{"status":"ok"}`. A static repository preview is not a running processing server. For local use, start it with `python -m app` and open `http://127.0.0.1:8000`. For a hosted instance, deploy the app and API together and set the allowed host/origin variables above.
 
+PDF/A-2b conversion requires Ghostscript, veraPDF, an RGB ICC profile, and an output-condition name on the processing server. Install and configure those tools in the server environment; the app does not download or provision them. Set `PAPERTRAIL_GHOSTSCRIPT` and `PAPERTRAIL_VERAPDF` if their executables are not discoverable on `PATH`, and set `PAPERTRAIL_PDFA_ICC_PROFILE` to the ICC profile path and `PAPERTRAIL_PDFA_OUTPUT_CONDITION` to its output-condition identifier. Conversion uses Ghostscript's strict compatibility policy and only returns a document after veraPDF reports PDF/A-2b compliance. Otherwise the feature reports setup-required or conversion failure.
+
 ## OCR setup
 
 OCR uses the Tesseract executable installed on the processing server, plus its language data. English is the default; Hindi and English+Hindi are selectable when the corresponding language packs are installed. The app can list installed language packs but does not install them. Without Tesseract, the OCR tools report that setup is required and the rest of the toolkit remains available. OCR can export recognized text to `.txt` or create a raster-backed searchable PDF, with a 100-page per-operation cap for searchable output.
@@ -42,8 +44,9 @@ OCR uses the Tesseract executable installed on the processing server, plus its l
 
 - **Page organization:** merge, split into page groups, rotate, reorder, extract pages, delete pages, duplicate selected pages, reverse page order, insert blank pages, set PDF page labels, crop all pages by a margin, and scale pages to A4, Letter, or Legal.
 - **Conversions:** PNG/JPEG/BMP/TIFF images to PDF, PDF pages to PNG files in a ZIP or raster-image PowerPoint slides, PDF text/Markdown/DOCX/XLSX/accessibility-text export, UTF-8 text to PDF, basic Markdown-to-PDF, text-focused HTML-to-PDF, EPUB-to-PDF, text-focused DOCX/XLSX/PPTX-to-PDF, and SVG-to-PDF.
-- **Optimization and accessibility:** PDF structural compression, embedded-image recompression, linearize for progressive web viewing, validate pages with the PDF parser, recover and rewrite damaged PDFs, grayscale/deskew/enhance scanned pages, remove visually duplicate pages, and report basic PDF accessibility indicators.
+- **Optimization and accessibility:** PDF structural compression, embedded-image recompression, linearize for progressive web viewing, validate pages with the PDF parser, recover and rewrite damaged PDFs, grayscale/deskew/enhance scanned pages, remove visually duplicate pages, and report basic PDF accessibility indicators. PDF/A-2b conversion is available only when the server has Ghostscript, veraPDF, an RGB ICC profile, and an output condition configured; a passing veraPDF report is required before output is returned.
 - **OCR:** export recognized text, create searchable PDFs, and list installed Tesseract language packs on the processing server. OCR tools are setup-required until Tesseract is detected.
+- **Structure and reading order:** add basic page-level structure tags to PDFs with selectable text and set the order of those page elements. Tagging rejects existing structure trees and does not infer headings, describe images, or produce PDF/UA-conforming documents. Reading-order editing only supports PDFs created by this basic tagging operation; it changes logical reading order without moving visible pages.
 - **Annotations:** centered text watermark, positioned text stamps, headers/footers with optional page counts, page numbers, exact-text highlighting and redaction, comments, and rectangle drawing.
 - **Comparison:** compare extracted text, generate a side-by-side page PDF, or create a thresholded visual-difference PDF. Each comparison requires exactly two input PDFs, in original-then-revised order.
 - **Security and forms:** encrypt PDFs with separate user/owner passwords, decrypt with the document password, apply basic reader-enforced permission profiles, sign or certify using a per-request PFX/P12 upload, verify embedded digital signatures, fill fields by name, flatten supported text/choice fields, and remove hidden metadata, links, scripts, attachments, and form data.
@@ -51,6 +54,8 @@ OCR uses the Tesseract executable installed on the processing server, plus its l
 - **Metadata:** update title, author, subject, and keywords, or clear standard and XMP metadata.
 - **Batch processing:** run up to 10 validated PDF-to-PDF operations in order as one temporary request.
 - **Workflow builder and presets:** visually compose up to 10 supported PDF-to-PDF steps, run them as one request, and save/load/delete named workflow settings in this browser. Presets contain operation names and settings only; they do not include PDFs, outputs, or server job history and are not synced to another browser.
+- **Watch folder:** select a folder in a supported browser and process newly added or changed top-level PDFs after they remain stable across two 3-second checks while the page remains open. Existing PDFs are skipped. Choose a single operation from the safe, no-extra-options list; each selected PDF is uploaded to the processing server. Failed files are not retried until changed or added again. The folder selection is not saved, and the ten most recent output links remain available in the page until you leave the tool.
+- **Local job history:** browse and clear up to 50 recent jobs saved in this browser. History contains filenames and job metadata only; it cannot restore or download a document.
 
 Page rasterization in grayscale intentionally removes selectable text/vector content; duplicate detection may remove pages with identical visual output even if their underlying text differs. Page resizing may lose annotations, forms, and document structure. Operations that rewrite a PDF can invalidate existing digital signatures. Compression is not guaranteed to reduce file size. The application keeps inputs and outputs in process memory after the upload buffer is read and returns outputs directly; it does not provide durable storage, authentication, user accounts, or a public hosted service.
 
@@ -72,9 +77,9 @@ Word and spreadsheet conversion supports modern `.docx` and `.xlsx` files only a
 
 PowerPoint-to-PDF extracts slide text and table values into a text-focused PDF; it does not render the original slide layout, images, charts, fonts, or animations. PDF-to-PowerPoint creates one non-editable 96-DPI page image per slide, limited to 100 pages, 8 million pixels per page, and 40 million rendered pixels per request.
 
-## Remaining roadmap
+## Setup-required tools
 
-The catalog still marks five entries as planned: PDF/A conversion, structure tagging, reading-order editing, watch-folder processing, and job history. They are not active features. PDF/A and tagged-PDF work need standards-aware implementation and validation rather than metadata-only changes; watch-folder processing would require explicitly scoped server filesystem access; job history is intentionally excluded because this app does not keep a job archive.
+The catalog marks tools as setup-required when optional processing-server dependencies are unavailable. OCR requires Tesseract and language data. PDF/A-2b conversion requires Ghostscript, veraPDF, an RGB ICC profile, and a configured output condition; every output must pass veraPDF validation. Structure tagging and page-level reading-order editing are implemented with the limitations described above and are not PDF/UA conformance features.
 
 ## Tests
 
@@ -82,4 +87,4 @@ The catalog still marks five entries as planned: PDF/A conversion, structure tag
 python -m unittest discover -s tests -v
 ```
 
-The test suite covers implemented PDF operations, API upload handling, digital signing and certification, invalid page selections, catalog status, and the missing-Tesseract error path.
+The test suite covers implemented PDF operations, API upload handling, digital signing and certification, invalid page selections, catalog status, browser-only tool endpoint protection, and the missing-Tesseract error path.
