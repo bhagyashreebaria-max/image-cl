@@ -6,37 +6,46 @@ The processing API receives uploaded documents. It reads the request into memory
 
 ## Run locally
 
-Requires Python 3.10 or newer.
+Requires Go 1.22 or newer and Python 3.10 or newer.
+
+PyMuPDF remains a required processing dependency. Its AGPL-3.0 terms and the Artifex Commercial License option may affect deployment or distribution. This project makes no legal-clearance claim; obtain qualified legal review of the applicable obligations before launch and secure any license that review determines is needed.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m app
+go run .
 ```
 
-Open `http://127.0.0.1:8000`. The app accepts up to 80 MiB of input per operation. Most operations do not accept encrypted PDFs. Use Decrypt PDF first when you have the document password.
+Open `http://127.0.0.1:8000`. The Go API serves the browser app, owns the public API routes, and starts the existing Python PDF processor as a private worker on `127.0.0.1:8001`; only the Go API port is intended to be exposed. Go validates requests, reconstructs the internal multipart worker request, and streams results back. The app accepts up to 80 MiB of input per operation. Most operations do not accept encrypted PDFs. Use Decrypt PDF first when you have the document password.
 
-## Deploy the processing server
+`GET /api` describes the API routes. `GET /api/tools` lists every operation and its current availability; `GET /api/status` reports capabilities and limits. Run an operation with `POST /api/process/{tool}` using multipart form data: attach input documents under the `files` field and include that tool's options as additional form fields. `POST /api/inspect` accepts one document under `file`. Successful processing responses stream the generated file with a `Content-Disposition` filename. Errors use JSON with a human-readable `detail` field. Existing `/api/...` routes and the browser UI continue to work through the Go API.
 
-The app is provider-neutral; it does not create or select cloud resources. Put it behind HTTPS and an authenticated reverse proxy before exposing it beyond a trusted network. The application has allowed-host and allowed-origin checks, but those are not user authentication, rate limiting, or a substitute for deployment controls.
+The Go API streams reconstructed input to the worker and streams output to the client, limits request bodies to 80 MiB plus 2 MiB for multipart framing, and waits up to 15 minutes for a worker response. Multipart input parsing uses temporary files above an 8 MiB memory threshold and removes those temporary files after dispatch. The Python worker retains the per-process processing concurrency limit and queue timeout described below. An unavailable worker yields HTTP 503; worker response timeouts yield HTTP 504.
+
+## Deploy the Go API and processing worker
+
+The app is provider-neutral; it does not create or select cloud resources. Run the Go API from the repository root with its Python dependencies installed. By default it starts one Python worker bound to loopback and calls that worker through an internal protocol. Expose the Go API only; do not expose the worker port. Put the API behind HTTPS and an authenticated reverse proxy before exposing it beyond a trusted network. The application has allowed-host and allowed-origin checks, but those are not user authentication, rate limiting, or a substitute for deployment controls.
 
 Set these variables for a deployment. Replace the sample host and origin with the actual public hostname:
 
 ```text
 PAPERTRAIL_HOST=0.0.0.0
 PAPERTRAIL_PORT=8000
+PAPERTRAIL_WORKER_PORT=8001
+PAPERTRAIL_PYTHON_COMMAND=python
+PAPERTRAIL_WORKER_STARTUP_TIMEOUT=60s
 PAPERTRAIL_ALLOWED_HOSTS=pdf.example.com
 PAPERTRAIL_ALLOWED_ORIGINS=https://pdf.example.com
 ```
 
-Configure the reverse proxy's request-body limit slightly above 80 MiB to account for multipart framing, and avoid logging request bodies. Protect the service with authentication, rate limits, and appropriate storage/temporary-directory policies. The `/health` endpoint can be used for a deployment health check.
+Configure the reverse proxy's request-body limit slightly above 82 MiB to account for multipart framing, and avoid logging request bodies. Protect the service with authentication, rate limits, and appropriate storage/temporary-directory policies. The `/health` endpoint checks that the worker is ready and can be used for a deployment health check. `PAPERTRAIL_WORKER_STARTUP_TIMEOUT` is a positive Go duration; the worker's port must be available locally. `PAPERTRAIL_ALLOWED_HOSTS` is enforced by the Go API; the private worker is restricted to loopback hosts. Other `PAPERTRAIL_*` processing settings (including concurrency and optional OCR/PDF/A setup) are inherited by the worker.
 
 Each server process accepts at most two PDF-processing or inspection jobs concurrently by default. Set `PAPERTRAIL_MAX_CONCURRENT_JOBS` to a value from 1 to 64 to tune that per-process limit for the host's available memory and CPU. Requests wait up to 30 seconds for a slot, then receive HTTP 503 with `Retry-After`. An operation accepts at most 100 uploaded files. Every raster-based operation is capped at 8 million pixels per page and 40 million pixels per operation; image-to-PDF is limited to 100 image pages as well. These limits bound common processing workloads but do not make arbitrary uploads safe to process without authentication, quotas, and infrastructure-level resource limits. A multi-worker or multi-replica deployment multiplies the configured concurrency; size it against measured peak memory rather than request count alone.
 
 This repository is a synchronous, stateless processing service, not a globally distributed multi-tenant platform. It has no user or tenant database, durable job queue, shared rate limiter, or persistent object storage. Horizontal replicas can serve independent requests, but they do not coordinate capacity or quotas. Serving very large populations requires additional architecture and measured capacity planning: authenticated API ingress, per-tenant quotas, a durable queue and separately scaled workers, object storage with lifecycle controls, a database for tenant/job metadata, and centralized metrics, tracing, and alerting. The current implementation has not been load-tested at production scale and cannot substantiate claims of support for trillions of users.
 
-The browser calls relative `/api/...` paths, so the frontend and processing API must be served from the same origin. If the interface shows a fetch error, open `/health` on that same host first; it should return `{"status":"ok"}`. A static repository preview is not a running processing server. For local use, start it with `python -m app` and open `http://127.0.0.1:8000`. For a hosted instance, deploy the app and API together and set the allowed host/origin variables above.
+The browser calls relative `/api/...` paths, so the frontend and Go API must be served from the same origin. If the interface shows a fetch error, open `/health` on that same host first; it should return `{"status":"ok"}` when the worker is ready. A static repository preview is not a running processing server. For local use, start the Go API with `go run .` and open `http://127.0.0.1:8000`. For a hosted instance, deploy the Go API and worker together and set the allowed host/origin variables above. For Python processor development without the Go API, `python -m app` still starts the processor API directly on port 8000 by default; do not expose the worker port in a Go-backed deployment.
 
 PDF/A-2b conversion requires Ghostscript, veraPDF, an RGB ICC profile, and an output-condition name on the processing server. Install and configure those tools in the server environment; the app does not download or provision them. Set `PAPERTRAIL_GHOSTSCRIPT` and `PAPERTRAIL_VERAPDF` if their executables are not discoverable on `PATH`, and set `PAPERTRAIL_PDFA_ICC_PROFILE` to the ICC profile path and `PAPERTRAIL_PDFA_OUTPUT_CONDITION` to its output-condition identifier. Conversion uses Ghostscript's strict compatibility policy and only returns a document after veraPDF reports PDF/A-2b compliance. Otherwise the feature reports setup-required or conversion failure.
 
@@ -88,7 +97,8 @@ The catalog marks tools as setup-required when optional processing-server depend
 ## Tests
 
 ```powershell
+go test ./...
 python -m unittest discover -s tests -v
 ```
 
-The test suite covers implemented PDF operations, API dispatch for every server-side catalog tool, API upload handling, digital signing and certification, invalid page selections, catalog status, browser-only tool endpoint protection, raster workload limits, and the missing-Tesseract error path.
+The Go tests cover API discovery, internal worker dispatch, health/readiness, request limits, and host/origin restrictions. The Python test suite covers implemented PDF operations, API dispatch for every server-side catalog tool, API upload handling, digital signing and certification, invalid page selections, catalog status, browser-only tool endpoint protection, raster workload limits, and the missing-Tesseract error path.
