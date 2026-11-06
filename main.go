@@ -105,10 +105,11 @@ func (g *apiServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /health", methodOnly(http.MethodGet, http.HandlerFunc(g.healthCheck)))
 	mux.Handle("/api", methodOnly(http.MethodGet, http.HandlerFunc(g.apiIndex)))
-	mux.Handle("/api/tools", methodOnly(http.MethodGet, http.HandlerFunc(g.tools)))
-	mux.Handle("/api/status", methodOnly(http.MethodGet, http.HandlerFunc(g.status)))
-	mux.Handle("/api/inspect", methodOnly(http.MethodPost, http.HandlerFunc(g.inspect)))
-	mux.Handle("/api/process/{tool}", methodOnly(http.MethodPost, http.HandlerFunc(g.process)))
+	mux.Handle("GET /api/v1/engine", methodOnly(http.MethodGet, http.HandlerFunc(g.engineCapabilities)))
+	for _, primitive := range []string{"compose", "transform", "protect", "pipeline"} {
+		mux.Handle("POST /api/v1/engine/"+primitive, methodOnly(http.MethodPost, http.HandlerFunc(g.engineRequest)))
+	}
+	mux.Handle("POST /api/v1/engine/inspect", methodOnly(http.MethodPost, http.HandlerFunc(g.inspect)))
 	mux.Handle("/api/", http.HandlerFunc(g.notFound))
 	mux.Handle("/", http.FileServer(http.FS(staticRoot)))
 	return g.limitAPIRequests(g.protectAPIOrigin(g.protectHost(mux)))
@@ -178,29 +179,23 @@ func (g *apiServer) limitAPIRequests(next http.Handler) http.Handler {
 
 func (g *apiServer) apiIndex(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name":        "Papertrail PDF API",
-		"description": "A single Go API for the PDF toolkit. Discover available operations and processing capabilities at /api/tools.",
+		"name":        "Prism Composable Document Engine",
+		"description": "Versioned Compose, Transform, Protect, Inspect, and Pipeline primitives for PDF documents.",
 		"endpoints": map[string]any{
-			"tools": map[string]string{
+			"capabilities": map[string]string{
 				"method":      http.MethodGet,
-				"path":        "/api/tools",
-				"description": "List PDF operations, categories, and runtime availability.",
+				"path":        "/api/v1/engine",
+				"description": "List the operations actually supported by each primitive and service limits.",
 			},
-			"status": map[string]string{
-				"method":      http.MethodGet,
-				"path":        "/api/status",
-				"description": "Read processing capabilities and upload/concurrency limits.",
-			},
-			"process": map[string]string{
+			"compose": map[string]string{
 				"method":      http.MethodPost,
-				"path":        "/api/process/{tool}",
-				"description": "Run a catalog operation with multipart/form-data; upload inputs as files and pass operation options as form fields.",
+				"path":        "/api/v1/engine/compose",
+				"description": "Merge uploaded PDFs and apply ordered page operations from a JSON steps field.",
 			},
-			"inspect": map[string]string{
-				"method":      http.MethodPost,
-				"path":        "/api/inspect",
-				"description": "Inspect a PDF using multipart/form-data with a single file field.",
-			},
+			"transform": map[string]string{"method": http.MethodPost, "path": "/api/v1/engine/transform"},
+			"protect":   map[string]string{"method": http.MethodPost, "path": "/api/v1/engine/protect"},
+			"inspect":   map[string]string{"method": http.MethodPost, "path": "/api/v1/engine/inspect"},
+			"pipeline":  map[string]string{"method": http.MethodPost, "path": "/api/v1/engine/pipeline"},
 		},
 		"health":            "/health",
 		"max_input_bytes":   maxInputBytes,
@@ -209,25 +204,21 @@ func (g *apiServer) apiIndex(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (g *apiServer) tools(w http.ResponseWriter, r *http.Request) {
-	g.workerJSON(w, r, "/api/tools")
-}
-
-func (g *apiServer) status(w http.ResponseWriter, r *http.Request) {
-	g.workerJSON(w, r, "/api/status")
+func (g *apiServer) engineCapabilities(w http.ResponseWriter, r *http.Request) {
+	g.workerJSON(w, r, "/api/v1/engine")
 }
 
 func (g *apiServer) inspect(w http.ResponseWriter, r *http.Request) {
-	g.forwardMultipart(w, r, "/api/inspect", "file")
+	g.forwardMultipart(w, r, "/api/v1/engine/inspect", "file")
 }
 
-func (g *apiServer) process(w http.ResponseWriter, r *http.Request) {
-	tool := r.PathValue("tool")
-	if tool == "" || strings.Contains(tool, "/") {
-		writeJSON(w, http.StatusNotFound, apiError{Detail: "That tool is not available."})
+func (g *apiServer) engineRequest(w http.ResponseWriter, r *http.Request) {
+	primitive := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	if primitive != "compose" && primitive != "transform" && primitive != "protect" && primitive != "pipeline" {
+		writeJSON(w, http.StatusNotFound, apiError{Detail: "That engine primitive is not available."})
 		return
 	}
-	g.forwardMultipart(w, r, "/api/process/"+url.PathEscape(tool), "files")
+	g.forwardMultipart(w, r, "/api/v1/engine/"+primitive, "files")
 }
 
 func (g *apiServer) notFound(w http.ResponseWriter, _ *http.Request) {

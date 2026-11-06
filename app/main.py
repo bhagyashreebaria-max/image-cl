@@ -1,35 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pymupdf as fitz
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, get_tool_catalog
-from app.pdf_tools import (
-    BATCH_OPTION_KEYS,
-    BATCH_TOOLS,
-    MAX_INPUT_FILES,
-    MAX_UPLOAD_BYTES,
-    ToolError,
-    form_fields,
-    open_pdf,
-    reading_order_entry_count,
-    run_tool,
+from app.engine import (
+    MAX_PREVIEW_PAGES,
+    MAX_PIPELINE_STEPS,
+    PRIMITIVE_OPERATIONS,
+    execute_engine,
+    execute_pipeline,
+    inspect_document,
+    parse_steps,
 )
+from app.pdf_tools import MAX_INPUT_FILES, MAX_UPLOAD_BYTES, ToolError
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("papertrail-pdf-toolkit")
+logger = logging.getLogger("prism-document-engine")
 
 STATIC_DIR = Path(__file__).parent / "static"
-app = FastAPI(title="Papertrail PDF Toolkit", docs_url=None, redoc_url=None)
+app = FastAPI(title="Prism Composable Document Engine", docs_url=None, redoc_url=None)
 try:
     MAX_CONCURRENT_JOBS = int(os.environ.get("PAPERTRAIL_MAX_CONCURRENT_JOBS", "2"))
 except ValueError as error:
@@ -70,16 +70,13 @@ async def protect_api_origin(request, call_next):
 
 @app.middleware("http")
 async def limit_processing_concurrency(request, call_next):
-    if request.url.path != "/api/inspect" and not request.url.path.startswith("/api/process/"):
+    if not request.url.path.startswith("/api/v1/engine/"):
         return await call_next(request)
     try:
-        await asyncio.wait_for(
-            processing_slots.acquire(),
-            timeout=PROCESSING_QUEUE_TIMEOUT_SECONDS,
-        )
+        await asyncio.wait_for(processing_slots.acquire(), timeout=PROCESSING_QUEUE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        return Response(
-            "The processing service is at capacity. Please retry shortly.",
+        return JSONResponse(
+            {"detail": "The processing service is at capacity. Please retry shortly."},
             status_code=503,
             headers={"Retry-After": "5"},
         )
@@ -94,41 +91,116 @@ async def health_check():
     return {"status": "ok"}
 
 
-@app.get("/api/status")
-async def get_status():
+@app.get("/api/v1/engine")
+async def engine_capabilities():
     return {
-        "server_processing": True,
-        "ready_tools": sorted(READY_TOOL_IDS),
-        "workflow_tools": sorted(BATCH_TOOLS),
-        "workflow_options": {tool: sorted(options) for tool, options in BATCH_OPTION_KEYS.items()},
+        "name": "Prism Composable Document Engine",
+        "api_version": "v1",
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+        "max_pipeline_steps": MAX_PIPELINE_STEPS,
+        "page_preview_limit": MAX_PREVIEW_PAGES,
+        "primitives": {
+            primitive: {
+                operation: sorted(options)
+                for operation, options in operations.items()
+            }
+            for primitive, operations in PRIMITIVE_OPERATIONS.items()
+        },
+        "pipeline": {"path": "/api/v1/engine/pipeline", "max_steps": MAX_PIPELINE_STEPS},
+        "input_storage": "Request parsing may use temporary storage; this service does not retain jobs or outputs.",
     }
 
 
-@app.get("/api/tools")
-async def get_tools():
-    return get_tool_catalog()
-
-
-def inspect_pdf_data(filename: str, data: bytes) -> dict[str, object]:
-    document = open_pdf(data, filename)
+def parse_recipe(value: str) -> list[dict[str, Any]]:
     try:
-        fields = [
-            {"name": widget.field_name, "type": widget.field_type_string}
-            for widget in form_fields(document)
-        ]
-        return {
-            "page_count": document.page_count,
-            "fields": fields,
-            "reading_order_count": reading_order_entry_count(filename, data),
-        }
+        recipe = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ToolError("'recipe' must be a valid JSON array.") from error
+    if not isinstance(recipe, list) or not 1 <= len(recipe) <= MAX_PIPELINE_STEPS:
+        raise ToolError(f"'recipe' must contain between 1 and {MAX_PIPELINE_STEPS} steps.")
+    return parse_steps(json.dumps(recipe), field_name="recipe")
+
+
+async def read_uploads(uploads: list[UploadFile]) -> list[tuple[str, bytes]]:
+    if not uploads:
+        raise HTTPException(status_code=400, detail="Provide at least one PDF document.")
+    if len(uploads) > MAX_INPUT_FILES:
+        raise HTTPException(status_code=413, detail=f"An operation can include at most {MAX_INPUT_FILES} files.")
+    payloads: list[tuple[str, bytes]] = []
+    total_size = 0
+    try:
+        for upload in uploads:
+            content = await upload.read(MAX_UPLOAD_BYTES - total_size + 1)
+            total_size += len(content)
+            if total_size > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Combined input files exceed the 80 MiB server limit.")
+            payloads.append((upload.filename or "document.pdf", content))
     finally:
-        document.close()
+        for upload in uploads:
+            await upload.close()
+    return payloads
 
 
-@app.post("/api/inspect")
-async def inspect_pdf(file: UploadFile = File(...)):
+def file_response(result) -> Response:
+    return Response(
+        content=result.data,
+        media_type=result.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{result.filename}"',
+            "X-Input-Bytes": str(result.input_bytes),
+            "X-Output-Bytes": str(len(result.data)),
+        },
+    )
+
+
+async def run_engine_request(primitive: str, uploads: list[UploadFile], raw_steps: str, *, pipeline: bool = False):
+    try:
+        try:
+            steps = parse_recipe(raw_steps) if pipeline else parse_steps(raw_steps)
+        except ToolError:
+            for upload in uploads:
+                await upload.close()
+            raise
+        files = await read_uploads(uploads)
+        runner = execute_pipeline if pipeline else execute_engine
+        arguments = (files, steps) if pipeline else (primitive, files, steps)
+        result = await run_in_threadpool(runner, *arguments)
+        return file_response(result)
+    except HTTPException:
+        raise
+    except ToolError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (fitz.FileDataError, fitz.EmptyFileError, ValueError) as error:
+        logger.info("Rejected document input for %s: %s", primitive, error)
+        raise HTTPException(status_code=400, detail="The document could not be processed. Check that it is a valid, unencrypted PDF.") from error
+    except Exception as error:
+        logger.exception("Unexpected error while running the %s engine", primitive)
+        raise HTTPException(status_code=500, detail="Processing failed. Check the processing server logs for details.") from error
+
+
+@app.post("/api/v1/engine/compose")
+async def compose_engine(files: list[UploadFile] = File(...), steps: str = Form("[]")):
+    return await run_engine_request("compose", files, steps)
+
+
+@app.post("/api/v1/engine/transform")
+async def transform_engine(files: list[UploadFile] = File(...), steps: str = Form(...)):
+    return await run_engine_request("transform", files, steps)
+
+
+@app.post("/api/v1/engine/protect")
+async def protect_engine(files: list[UploadFile] = File(...), steps: str = Form(...)):
+    return await run_engine_request("protect", files, steps)
+
+
+@app.post("/api/v1/engine/pipeline")
+async def pipeline_engine(files: list[UploadFile] = File(...), recipe: str = Form(...)):
+    return await run_engine_request("pipeline", files, recipe, pipeline=True)
+
+
+@app.post("/api/v1/engine/inspect")
+async def inspect_engine(file: UploadFile = File(...)):
     try:
         data = await file.read(MAX_UPLOAD_BYTES + 1)
     finally:
@@ -136,133 +208,15 @@ async def inspect_pdf(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than the 80 MiB server limit.")
     try:
-        return await run_in_threadpool(
-            inspect_pdf_data,
-            file.filename or "document.pdf",
-            data,
-        )
-    except ToolError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
-
-
-@app.post("/api/process/{tool}")
-async def process_pdf(
-    tool: str,
-    files: list[UploadFile] = File(...),
-    ranges: str = Form(""),
-    rotation: int = Form(90),
-    order: str = Form(""),
-    language: str = Form("eng"),
-    document_language: str = Form("en-US"),
-    structure_order: str = Form(""),
-    prefix: str = Form(""),
-    label_style: str = Form("D"),
-    first_number: int = Form(1),
-    margin: float = Form(24),
-    page_size: str = Form("a4"),
-    dpi: int = Form(120),
-    quality: int = Form(70),
-    watermark: str = Form(""),
-    stamp_position: str = Form("center"),
-    header: str = Form(""),
-    footer: str = Form(""),
-    page_number: bool = Form(True),
-    title: str = Form(""),
-    author: str = Form(""),
-    subject: str = Form(""),
-    keywords: str = Form(""),
-    profile: str = Form("copy"),
-    user_password: str = Form(""),
-    owner_password: str = Form(""),
-    password: str = Form(""),
-    phrase: str = Form(""),
-    comment: str = Form(""),
-    x: float = Form(50),
-    y: float = Form(50),
-    width: float = Form(100),
-    height: float = Form(60),
-    field_values: str = Form(""),
-    batch_steps: str = Form(""),
-    certificate_password: str = Form(""),
-    signature_field: str = Form("Signature1"),
-    signature_reason: str = Form(""),
-):
-    if tool not in READY_TOOL_IDS or tool in BROWSER_ONLY_TOOL_IDS:
-        raise HTTPException(status_code=404, detail="That tool is not available yet.")
-    if len(files) > MAX_INPUT_FILES:
-        raise HTTPException(status_code=413, detail=f"An operation can include at most {MAX_INPUT_FILES} files.")
-    payloads: list[tuple[str, bytes]] = []
-    total_size = 0
-    try:
-        for upload in files:
-            name = upload.filename or "document"
-            content = await upload.read(MAX_UPLOAD_BYTES + 1)
-            total_size += len(content)
-            if total_size > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Combined input files exceed the 80 MiB server limit.")
-            payloads.append((name, content))
-    finally:
-        for upload in files:
-            await upload.close()
-
-    try:
-        result = await run_in_threadpool(
-            run_tool,
-            tool,
-            payloads,
-            ranges=ranges,
-            rotation=rotation,
-            order=order,
-            language=language,
-            document_language=document_language,
-            structure_order=structure_order,
-            prefix=prefix,
-            label_style=label_style,
-            first_number=first_number,
-            margin=margin,
-            page_size=page_size,
-            dpi=dpi,
-            quality=quality,
-            watermark=watermark,
-            stamp_position=stamp_position,
-            header=header,
-            footer=footer,
-            page_number=page_number,
-            title=title,
-            author=author,
-            subject=subject,
-            keywords=keywords,
-            profile=profile,
-            user_password=user_password,
-            owner_password=owner_password,
-            phrase=phrase,
-            comment=comment,
-            x=x,
-            y=y,
-            width=width,
-            height=height,
-            field_values=field_values,
-            batch_steps=batch_steps,
-            certificate_password=certificate_password,
-            signature_field=signature_field,
-            signature_reason=signature_reason,
-            password=password,
-        )
+        return await run_in_threadpool(inspect_document, file.filename or "document.pdf", data)
     except ToolError as error:
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
     except (fitz.FileDataError, fitz.EmptyFileError, ValueError) as error:
-        logger.info("Rejected PDF input for %s: %s", tool, error)
-        raise HTTPException(status_code=400, detail="The PDF could not be processed. Check that it is valid and unencrypted.") from error
+        logger.info("Rejected document for inspection: %s", error)
+        raise HTTPException(status_code=400, detail="The document could not be inspected. Check that it is a valid, unencrypted PDF.") from error
     except Exception as error:
-        logger.exception("Unexpected error while running %s", tool)
-        raise HTTPException(status_code=500, detail="Processing failed. Check the processing server logs for details.") from error
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{result.filename}"',
-        "X-Input-Bytes": str(result.input_bytes),
-        "X-Output-Bytes": str(len(result.data)),
-    }
-    return Response(content=result.data, media_type=result.media_type, headers=headers)
+        logger.exception("Unexpected error while inspecting a document")
+        raise HTTPException(status_code=500, detail="Inspection failed. Check the processing server logs for details.") from error
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
