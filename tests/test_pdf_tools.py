@@ -1,9 +1,6 @@
 import asyncio
 import io
 from datetime import datetime, timedelta, timezone
-import os
-from pathlib import Path
-import tempfile
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -20,14 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, pkcs12
 from fastapi.testclient import TestClient
 
-from app.catalog import BROWSER_ONLY_TOOL_IDS, READY_TOOL_IDS, TOOL_CATALOG
+from app.engine import parse_steps
 from app.main import MAX_CONCURRENT_JOBS, MAX_INPUT_FILES, app
 from app.pdf_tools import (
     ToolError,
-    ToolResult,
     add_headers_footers_pdf,
     accessible_text_export,
-    run_tool,
     sign_pdf,
     compress_pdf,
     compare_page_renderings,
@@ -88,8 +83,6 @@ from app.pdf_tools import (
     excel_to_pdf,
     decrypt_pdf,
     epub_to_pdf,
-    convert_pdfa,
-    pdfa_setup_available,
     reading_order_entry_count,
     set_reading_order,
     tag_pdf_structure,
@@ -155,44 +148,60 @@ def make_pkcs12_certificate() -> bytes:
 
 
 class PDFToolsTests(unittest.TestCase):
-    def test_catalog_has_expected_tool_count(self):
-        self.assertEqual(len(TOOL_CATALOG), 69)
+    def test_engine_capabilities_describe_supported_primitives(self):
+        response = TestClient(app).get("/api/v1/engine")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["name"], "Prism Composable Document Engine")
+        self.assertEqual(payload["api_version"], "v1")
+        self.assertIn("reverse", payload["primitives"]["compose"])
+        self.assertIn("compress", payload["primitives"]["transform"])
+        self.assertIn("encrypt", payload["primitives"]["protect"])
+        self.assertEqual(payload["pipeline"]["max_steps"], 10)
+        self.assertIn("temporary storage", payload["input_storage"])
 
-    def test_catalog_reports_available_tools_as_ready(self):
-        from app.catalog import get_tool_catalog
-
-        catalog = get_tool_catalog()
-        statuses = {tool["id"]: tool["status"] for tool in catalog}
-        excluded_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
-        self.assertTrue(excluded_tools.isdisjoint(statuses))
-        self.assertTrue(excluded_tools.isdisjoint(READY_TOOL_IDS))
-        self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in READY_TOOL_IDS))
-        self.assertEqual(
-            BROWSER_ONLY_TOOL_IDS,
-            {"watch-folder", "history", "presets", "workflow-builder"},
-        )
-        self.assertTrue(all(statuses[tool_id] == "ready" for tool_id in BROWSER_ONLY_TOOL_IDS))
-
-    def test_processing_endpoint_dispatches_every_server_tool(self):
+    def test_catalog_and_legacy_workflow_endpoints_are_removed(self):
         client = TestClient(app)
-        server_tools = READY_TOOL_IDS - BROWSER_ONLY_TOOL_IDS
-        sample_pdf = make_pdf("sample")
-        with patch("app.main.run_tool", return_value=ToolResult(b"processed", "result.pdf")) as process:
-            for tool in sorted(server_tools):
-                with self.subTest(tool=tool):
-                    response = client.post(
-                        f"/api/process/{tool}",
-                        headers={"origin": "http://localhost:8000"},
-                        files={"files": ("document.pdf", sample_pdf, "application/pdf")},
-                    )
-                    self.assertEqual(response.status_code, 200, response.text)
-                    self.assertEqual(process.call_args.args[0], tool)
+        for path in ("/api/tools", "/api/status", "/api/process/merge", "/api/watch-folder"):
+            with self.subTest(path=path):
+                self.assertEqual(client.get(path).status_code, 404)
+        self.assertFalse(hasattr(__import__("app.main", fromlist=["app"]), "get_tools"))
+
+    def test_compose_api_merges_and_applies_page_sequence(self):
+        response = TestClient(app).post(
+            "/api/v1/engine/compose",
+            headers={"origin": "http://localhost:8000"},
+            files=[
+                ("files", ("first.pdf", make_pdf("first page"), "application/pdf")),
+                ("files", ("second.pdf", make_pdf("second page"), "application/pdf")),
+            ],
+            data={"steps": '[{"primitive":"compose","operation":"rotate-pages","options":{"pages":[2],"rotation":90}},{"primitive":"compose","operation":"reorder","options":{"order":"2,1"}}]'},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        document = fitz.open(stream=response.content, filetype="pdf")
+        self.assertEqual(document.page_count, 2)
+        self.assertIn("second page", document[0].get_text())
+        self.assertEqual(document[0].rotation, 90)
+        self.assertIn("first page", document[1].get_text())
+        document.close()
+
+    def test_transform_api_applies_a_watermark(self):
+        response = TestClient(app).post(
+            "/api/v1/engine/transform",
+            headers={"origin": "http://localhost:8000"},
+            files={"files": ("report.pdf", make_pdf("source text"), "application/pdf")},
+            data={"steps": '[{"primitive":"transform","operation":"watermark","options":{"watermark":"PRISM DRAFT"}}]'},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        document = fitz.open(stream=response.content, filetype="pdf")
+        self.assertIn("PRISM DRAFT", document[0].get_text())
+        document.close()
 
     def test_processing_capacity_returns_retryable_status(self):
         with patch("app.main.processing_slots", asyncio.Semaphore(0)), patch(
             "app.main.PROCESSING_QUEUE_TIMEOUT_SECONDS", 0.01
         ), TestClient(app) as client:
-            for path, field in (("/api/process/merge", "files"), ("/api/inspect", "file")):
+            for path, field in (("/api/v1/engine/compose", "files"), ("/api/v1/engine/inspect", "file")):
                 with self.subTest(path=path):
                     response = client.post(
                         path,
@@ -209,94 +218,11 @@ class PDFToolsTests(unittest.TestCase):
             for index in range(MAX_INPUT_FILES + 1)
         ]
         response = client.post(
-            "/api/process/merge",
+            "/api/v1/engine/compose",
             headers={"origin": "http://localhost:8000"},
             files=files,
         )
         self.assertEqual(response.status_code, 413)
-
-    def test_pdfa_setup_rejects_malformed_icc_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
-            profile = Path(directory) / "invalid.icc"
-            profile.write_bytes(b"not an ICC profile")
-            environ = {
-                "PAPERTRAIL_GHOSTSCRIPT": "ghostscript",
-                "PAPERTRAIL_VERAPDF": "verapdf",
-                "PAPERTRAIL_PDFA_ICC_PROFILE": str(profile),
-                "PAPERTRAIL_PDFA_OUTPUT_CONDITION": "test",
-            }
-            with patch.dict(os.environ, environ, clear=True), patch(
-                "app.pdf_tools.shutil.which", side_effect=lambda name: name
-            ):
-                with self.assertRaisesRegex(ToolError, "readable RGB ICC profile"):
-                    convert_pdfa("source.pdf", make_pdf("sample"))
-
-    def test_browser_only_tools_cannot_be_submitted_to_processing_endpoint(self):
-        client = TestClient(app)
-        for tool in BROWSER_ONLY_TOOL_IDS:
-            with self.subTest(tool=tool):
-                response = client.post(
-                    f"/api/process/{tool}",
-                    headers={"origin": "http://localhost:8000"},
-                    files={"files": ("document.pdf", make_pdf("sample"), "application/pdf")},
-                )
-                self.assertEqual(response.status_code, 404)
-
-    def test_api_tagging_inspection_and_reading_order(self):
-        client = TestClient(app)
-        source = make_pdf("first page", "second page")
-        tagged = client.post(
-            "/api/process/tag-pdf",
-            headers={"origin": "http://localhost:8000"},
-            files={"files": ("source.pdf", source, "application/pdf")},
-            data={"document_language": "en-GB"},
-        )
-        self.assertEqual(tagged.status_code, 200, tagged.text)
-
-        inspected = client.post(
-            "/api/inspect",
-            headers={"origin": "http://localhost:8000"},
-            files={"file": ("tagged.pdf", tagged.content, "application/pdf")},
-        )
-        self.assertEqual(inspected.status_code, 200, inspected.text)
-        self.assertEqual(inspected.json()["reading_order_count"], 2)
-
-        reordered = client.post(
-            "/api/process/reading-order",
-            headers={"origin": "http://localhost:8000"},
-            files={"files": ("tagged.pdf", tagged.content, "application/pdf")},
-            data={"structure_order": "2, 1"},
-        )
-        self.assertEqual(reordered.status_code, 200, reordered.text)
-        with pikepdf.Pdf.open(io.BytesIO(reordered.content)) as document:
-            page_objects = [page.obj.objgen for page in document.pages]
-            children = list(document.Root.StructTreeRoot.K.K)
-            self.assertEqual([child.Pg.objgen for child in children], [page_objects[1], page_objects[0]])
-
-    def test_unincluded_tools_are_not_advertised_or_available(self):
-        client = TestClient(app)
-        excluded_tools = {"ocr-text", "ocr-searchable", "ocr-languages", "pdfa"}
-        catalog = client.get("/api/tools")
-        status = client.get("/api/status")
-        self.assertEqual(catalog.status_code, 200)
-        self.assertEqual(status.status_code, 200)
-        catalog_ids = {tool["id"] for tool in catalog.json()}
-        ready_ids = set(status.json()["ready_tools"])
-        self.assertTrue(excluded_tools.isdisjoint(catalog_ids))
-        self.assertTrue(excluded_tools.isdisjoint(ready_ids))
-        self.assertNotIn("ocr_available", status.json())
-        self.assertNotIn("pdfa_available", status.json())
-
-        for tool in excluded_tools:
-            with self.subTest(tool=tool):
-                response = client.post(
-                    f"/api/process/{tool}",
-                    headers={"origin": "http://localhost:8000"},
-                    files={"files": ("source.pdf", make_pdf("sample"), "application/pdf")},
-                )
-                self.assertEqual(response.status_code, 404)
-
-        self.assertEqual(client.get("/api/ocr-languages").status_code, 404)
 
     def test_basic_structure_tags_preserve_pages_and_support_page_reading_order(self):
         source = make_pdf("first page", "second page")
@@ -342,89 +268,19 @@ class PDFToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "each page"):
             set_reading_order("tagged.pdf", tagged.data, "1, 1")
 
-    def test_pdfa_setup_requires_ghostscript_verapdf_and_icc_profile(self):
-        with patch.dict(os.environ, {}, clear=True), patch("app.pdf_tools.shutil.which", return_value=None):
-            with self.assertRaisesRegex(ToolError, "Ghostscript.*veraPDF.*ICC profile") as error:
-                convert_pdfa("source.pdf", make_pdf("sample"))
-        self.assertEqual(error.exception.status_code, 503)
-
-    def test_pdfa_conversion_requires_a_passing_verapdf_report(self):
-        source = make_pdf("PDF/A conversion")
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ghostscript = root / "gs.exe"
-            ghostscript.touch()
-            icc_profile = root / "srgb.icc"
-            profile_bytes = bytearray(128)
-            profile_bytes[0:4] = (128).to_bytes(4, "big")
-            profile_bytes[16:20] = b"RGB "
-            profile_bytes[36:40] = b"acsp"
-            icc_profile.write_bytes(profile_bytes)
-            environ = {
-                "PAPERTRAIL_GHOSTSCRIPT": str(ghostscript),
-                "PAPERTRAIL_VERAPDF": "verapdf",
-                "PAPERTRAIL_PDFA_ICC_PROFILE": str(icc_profile),
-                "PAPERTRAIL_PDFA_OUTPUT_CONDITION": "sRGB (test)",
-            }
-            definition_text = {}
-
-            def fake_run(command, **kwargs):
-                if command[0] == str(ghostscript):
-                    output_path = Path(next(argument.split("=", 1)[1] for argument in command if argument.startswith("-sOutputFile=")))
-                    output_path.write_bytes(source)
-                    definition_path = Path(next(argument for argument in command if argument.endswith("PDFA_def.ps")))
-                    definition_text["value"] = definition_path.read_text(encoding="ascii")
-                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout='<report><jobs><job><validationReport isCompliant="true"/></job></jobs></report>',
-                    stderr="",
-                )
-
-            with patch.dict(os.environ, environ, clear=True), patch(
-                "app.pdf_tools.shutil.which", side_effect=lambda name: str(root / "verapdf.exe") if name == "verapdf" else None
-            ), patch("app.pdf_tools.subprocess.run", side_effect=fake_run) as run:
-                result = convert_pdfa("source.pdf", source)
-                self.assertEqual(result.filename, "source-pdfa-2b.pdf")
-                self.assertTrue(pdfa_setup_available())
-                self.assertEqual(run.call_count, 2)
-                gs_arguments = run.call_args_list[0].args[0]
-                self.assertIn("-dPDFA=2", gs_arguments)
-                self.assertIn("-dPDFACompatibilityPolicy=2", gs_arguments)
-                self.assertIn("/OutputConditionIdentifier (sRGB \\(test\\))", definition_text["value"])
-                self.assertIn("-f", run.call_args_list[1].args[0])
-
-            def fake_noncompliant_run(command, **kwargs):
-                if command[0] == str(ghostscript):
-                    output_path = Path(next(argument.split("=", 1)[1] for argument in command if argument.startswith("-sOutputFile=")))
-                    output_path.write_bytes(source)
-                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout='<report><jobs><job><validationReport isCompliant="false"/></job></jobs></report>',
-                    stderr="",
-                )
-
-            with patch.dict(os.environ, environ, clear=True), patch(
-                "app.pdf_tools.shutil.which", side_effect=lambda name: str(root / "verapdf.exe") if name == "verapdf" else None
-            ), patch("app.pdf_tools.subprocess.run", side_effect=fake_noncompliant_run):
-                with self.assertRaisesRegex(ToolError, "did not pass veraPDF"):
-                    convert_pdfa("source.pdf", source)
-
-    def test_api_exposes_exact_batch_workflow_options(self):
-        from app.pdf_tools import BATCH_OPTION_KEYS, BATCH_TOOLS
-
+    def test_capability_report_keeps_processing_limits(self):
         response = TestClient(app).get("/api/status")
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["max_concurrent_jobs"], MAX_CONCURRENT_JOBS)
-        self.assertEqual(set(payload["workflow_tools"]), BATCH_TOOLS)
-        self.assertEqual(
-            {tool: set(options) for tool, options in payload["workflow_options"].items()},
-            BATCH_OPTION_KEYS,
-        )
+        self.assertEqual(response.status_code, 404)
+        capabilities = TestClient(app).get("/api/v1/engine").json()
+        self.assertEqual(capabilities["max_concurrent_jobs"], MAX_CONCURRENT_JOBS)
+
+    def test_engine_step_parser_rejects_unknown_operations_and_options(self):
+        with self.assertRaisesRegex(ToolError, "unsupported compose operation"):
+            parse_steps('[{"primitive":"compose","operation":"booklet"}]')
+        with self.assertRaisesRegex(ToolError, "unsupported options"):
+            parse_steps('[{"primitive":"transform","operation":"compress","options":{"level":9}}]')
+        with self.assertRaisesRegex(ToolError, "wrong type"):
+            parse_steps('[{"primitive":"compose","operation":"rotate","options":{"rotation":"90"}}]')
 
     def test_parse_page_groups_accepts_multiple_outputs(self):
         self.assertEqual(parse_page_groups("1-2, 4; 5", 5), [[0, 1, 3], [4]])
@@ -671,35 +527,31 @@ class PDFToolsTests(unittest.TestCase):
         self.assertIn(b"REVIEW: Tagged structure tree", report.data)
         self.assertIn(b"PASS: Selectable text on every page", report.data)
 
-    def test_batch_runs_validated_pdf_operations_in_order(self):
-        source = make_pdf("batch content")
-        result = run_tool(
-            "batch",
-            [("report.pdf", source)],
-            batch_steps='[{"tool":"rotate","options":{"rotation":90}},{"tool":"watermark","options":{"watermark":"DRAFT"}}]',
-        )
-        document = fitz.open(stream=result.data, filetype="pdf")
-        self.assertEqual(document[0].rotation, 90)
-        self.assertIn("DRAFT", document[0].get_text())
-        document.close()
-        with self.assertRaisesRegex(ToolError, "unsupported PDF-to-PDF"):
-            run_tool("batch", [("report.pdf", source)], batch_steps='[{"tool":"merge"}]')
-        with self.assertRaisesRegex(ToolError, "wrong type"):
-            run_tool("batch", [("report.pdf", source)], batch_steps='[{"tool":"rotate","options":{"rotation":"90"}}]')
-
-    def test_api_batch_endpoint_runs_workflow_steps(self):
+    def test_api_pipeline_composes_transform_and_protects_in_one_request(self):
         response = TestClient(app).post(
-            "/api/process/batch",
+            "/api/v1/engine/pipeline",
             headers={"origin": "http://localhost:8000"},
-            files={"files": ("report.pdf", make_pdf("workflow content"), "application/pdf")},
-            data={"batch_steps": '[{"tool":"watermark","options":{"watermark":"DRAFT"}},{"tool":"rotate","options":{"rotation":90}}]'},
+            files={"files": ("report.pdf", make_pdf("pipeline content"), "application/pdf")},
+            data={"recipe": '[{"primitive":"compose","operation":"rotate","options":{"rotation":90}},{"primitive":"transform","operation":"watermark","options":{"watermark":"DRAFT"}},{"primitive":"protect","operation":"encrypt","options":{"user_password":"user-pass-1","owner_password":"owner-pass-1","profile":"copy"}}]'},
         )
         self.assertEqual(response.status_code, 200, response.text)
         document = fitz.open(stream=response.content, filetype="pdf")
-        self.assertIn("workflow content", document[0].get_text())
+        self.assertTrue(document.is_encrypted)
+        self.assertTrue(document.authenticate("user-pass-1"))
+        self.assertIn("pipeline content", document[0].get_text())
         self.assertIn("DRAFT", document[0].get_text())
-        self.assertEqual(round(document[0].rect.width), 842)
+        self.assertEqual(document[0].rotation, 90)
         document.close()
+
+    def test_pipeline_rejects_unsupported_steps(self):
+        response = TestClient(app).post(
+            "/api/v1/engine/pipeline",
+            headers={"origin": "http://localhost:8000"},
+            files={"files": ("report.pdf", make_pdf("content"), "application/pdf")},
+            data={"recipe": '[{"primitive":"transform","operation":"convert","options":{}}]'},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported transform operation", response.json()["detail"])
 
     def test_grayscale_conversion_is_raster_pdf(self):
         result = grayscale_pdf("report.pdf", make_pdf("sample"), 72)
@@ -770,12 +622,14 @@ class PDFToolsTests(unittest.TestCase):
     def test_inspect_api_reports_form_field_names(self):
         client = TestClient(app)
         response = client.post(
-            "/api/inspect",
+            "/api/v1/engine/inspect",
             headers={"origin": "http://localhost:8000"},
             files={"file": ("form.pdf", make_form_pdf(), "application/pdf")},
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["fields"][0]["name"], "full_name")
+        self.assertEqual(response.json()["page_count"], 1)
+        self.assertEqual(response.json()["pages"][0]["number"], 1)
 
     def test_extract_and_remove_embedded_attachments(self):
         document = fitz.open(stream=make_pdf("sample"), filetype="pdf")
@@ -924,20 +778,6 @@ class PDFToolsTests(unittest.TestCase):
         self.assertIn("protected content", document[0].get_text())
         document.close()
 
-    def test_api_comparison_accepts_two_uploaded_pdfs(self):
-        client = TestClient(app)
-        response = client.post(
-            "/api/process/compare-text",
-            headers={"origin": "http://localhost:8000"},
-            files=[
-                ("files", ("original.pdf", make_pdf("old text"), "application/pdf")),
-                ("files", ("revised.pdf", make_pdf("new text"), "application/pdf")),
-            ],
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertIn(b"-old text", response.content)
-        self.assertIn(b"+new text", response.content)
-
     def test_slide_conversions_process_uploads(self):
         presentation = make_pptx("Slide one content", "Second slide")
         converted = slides_to_pdf("deck.pptx", presentation)
@@ -955,44 +795,21 @@ class PDFToolsTests(unittest.TestCase):
     def test_slide_conversions_reject_unsupported_input(self):
         with self.assertRaisesRegex(ToolError, r"\.pptx"):
             slides_to_pdf("deck.ppt", b"not a presentation")
-        with self.assertRaisesRegex(ToolError, r"\.pdf"):
-            run_tool("pdf-to-slides", [("image.png", b"image")])
-
-    def test_api_pdf_to_slides_returns_presentation(self):
-        client = TestClient(app)
-        response = client.post(
-            "/api/process/pdf-to-slides",
-            headers={"origin": "http://localhost:8000"},
-            files={"files": ("report.pdf", make_pdf("first page"), "application/pdf")},
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(
-            response.headers["content-type"],
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        )
-        self.assertEqual(len(Presentation(io.BytesIO(response.content)).slides), 1)
-        converted = client.post(
-            "/api/process/slides-to-pdf",
-            headers={"origin": "http://localhost:8000"},
-            files={"files": ("deck.pptx", make_pptx("slide text"), "application/vnd.openxmlformats-officedocument.presentationml.presentation")},
-        )
-        self.assertEqual(converted.status_code, 200, converted.text)
-        self.assertIn("slide text", fitz.open(stream=converted.content, filetype="pdf")[0].get_text())
 
     def test_api_encrypt_and_decrypt_password_fields(self):
         client = TestClient(app)
         encrypted = client.post(
-            "/api/process/encrypt",
+            "/api/v1/engine/protect",
             headers={"origin": "http://localhost:8000"},
             files={"files": ("original.pdf", make_pdf("secret text"), "application/pdf")},
-            data={"user_password": "user-pass-1", "owner_password": "owner-pass-1", "profile": "copy"},
+            data={"steps": '[{"primitive":"protect","operation":"encrypt","options":{"user_password":"user-pass-1","owner_password":"owner-pass-1","profile":"copy"}}]'},
         )
         self.assertEqual(encrypted.status_code, 200, encrypted.text)
         decrypted = client.post(
-            "/api/process/decrypt",
+            "/api/v1/engine/protect",
             headers={"origin": "http://localhost:8000"},
             files={"files": ("protected.pdf", encrypted.content, "application/pdf")},
-            data={"password": "user-pass-1"},
+            data={"steps": '[{"primitive":"protect","operation":"decrypt","options":{"password":"user-pass-1"}}]'},
         )
         self.assertEqual(decrypted.status_code, 200, decrypted.text)
         document = fitz.open(stream=decrypted.content, filetype="pdf")
@@ -1000,42 +817,7 @@ class PDFToolsTests(unittest.TestCase):
         document.close()
 
     def test_api_sign_certify_and_verify_with_per_request_certificate(self):
-        client = TestClient(app)
         certificate = make_pkcs12_certificate()
-        invalid_certificate = client.post(
-            "/api/process/sign",
-            headers={"origin": "http://localhost:8000"},
-            files=[
-                ("files", ("original.pdf", make_pdf("signed content"), "application/pdf")),
-                ("files", ("invalid.p12", b"not a certificate", "application/x-pkcs12")),
-            ],
-        )
-        self.assertEqual(invalid_certificate.status_code, 400, invalid_certificate.text)
-        self.assertIn("certificate or password is invalid", invalid_certificate.text)
-
-        signed = client.post(
-            "/api/process/sign",
-            headers={"origin": "http://localhost:8000"},
-            files=[
-                ("files", ("original.pdf", make_pdf("signed content"), "application/pdf")),
-                ("files", ("signer.p12", certificate, "application/x-pkcs12")),
-            ],
-            data={
-                "certificate_password": "certificate-secret",
-                "signature_field": "Signature1",
-                "signature_reason": "Test signing",
-            },
-        )
-        self.assertEqual(signed.status_code, 200, signed.text)
-        verified = client.post(
-            "/api/process/verify-signature",
-            headers={"origin": "http://localhost:8000"},
-            files={"files": ("signed.pdf", signed.content, "application/pdf")},
-        )
-        self.assertEqual(verified.status_code, 200, verified.text)
-        self.assertIn(b"Cryptographic integrity: valid", verified.content)
-        self.assertIn(b"Certificate trusted by configured roots: no or unknown", verified.content)
-
         certified = sign_pdf(
             [("original.pdf", make_pdf("certified content")), ("signer.pfx", certificate)],
             "certificate-secret",

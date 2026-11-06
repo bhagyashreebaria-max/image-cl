@@ -27,13 +27,20 @@ func TestAPIIndexDocumentsUnifiedEndpoints(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("GET /api returned %d", response.Code)
 	}
-	for _, expected := range []string{"/api/tools", "/api/status", "/api/process/{tool}", "/api/inspect"} {
+	for _, expected := range []string{
+		"/api/v1/engine",
+		"/api/v1/engine/compose",
+		"/api/v1/engine/transform",
+		"/api/v1/engine/protect",
+		"/api/v1/engine/inspect",
+		"/api/v1/engine/pipeline",
+	} {
 		if !strings.Contains(response.Body.String(), expected) {
 			t.Errorf("API index does not include %q", expected)
 		}
 	}
-	if strings.Contains(response.Body.String(), "/api/ocr-languages") {
-		t.Error("API index still includes the removed OCR languages endpoint")
+	if strings.Contains(response.Body.String(), "/api/tools") || strings.Contains(response.Body.String(), "/api/process") {
+		t.Error("API index still advertises catalog or tool-specific routes")
 	}
 }
 
@@ -51,7 +58,7 @@ func TestRemovedOCRLanguagesEndpointIsNotAvailable(t *testing.T) {
 
 func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/process/merge" {
+		if r.URL.Path != "/api/v1/engine/compose" {
 			t.Errorf("worker received path %q", r.URL.Path)
 		}
 		if r.Host == "" {
@@ -64,8 +71,8 @@ func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {
 			t.Errorf("worker received invalid multipart request: %v", err)
 			return
 		}
-		if got := r.FormValue("ranges"); got != "1-2" {
-			t.Errorf("worker received ranges %q", got)
+		if got := r.FormValue("steps"); got != `[{"primitive":"compose","operation":"rotate","options":{"rotation":180}}]` {
+			t.Errorf("worker received steps %q", got)
 		}
 		files := r.MultipartForm.File["files"]
 		if len(files) != 1 {
@@ -100,7 +107,7 @@ func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {
 
 	var body strings.Builder
 	form := multipart.NewWriter(&body)
-	if err := form.WriteField("ranges", "1-2"); err != nil {
+	if err := form.WriteField("steps", `[{"primitive":"compose","operation":"rotate","options":{"rotation":180}}]`); err != nil {
 		t.Fatal(err)
 	}
 	filePart, err := form.CreateFormFile("files", "source.pdf")
@@ -113,7 +120,7 @@ func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {
 	if err := form.Close(); err != nil {
 		t.Fatal(err)
 	}
-	request := publicRequest(http.MethodPost, "/api/process/merge", strings.NewReader(body.String()))
+	request := publicRequest(http.MethodPost, "/api/v1/engine/compose", strings.NewReader(body.String()))
 	request.Header.Set("Content-Type", form.FormDataContentType())
 	request.Header.Set("Origin", testOrigin)
 	response := httptest.NewRecorder()
@@ -133,22 +140,22 @@ func TestGoAPIProcessesMultipartThroughPrivateWorker(t *testing.T) {
 	}
 }
 
-func TestToolsEndpointUsesGoAPIContract(t *testing.T) {
+func TestEngineCapabilitiesEndpointUsesGoAPIContract(t *testing.T) {
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/tools" {
+		if r.URL.Path != "/api/v1/engine" {
 			t.Errorf("worker received path %q", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"id":"merge","status":"ready"}]`))
+		_, _ = w.Write([]byte(`{"name":"Prism Composable Document Engine","primitives":{"compose":{"rotate":[]}}}`))
 	}))
 	defer worker.Close()
 	workerURL, _ := url.Parse(worker.URL)
 
 	response := httptest.NewRecorder()
-	newAPIServer(workerURL, testOrigin, testAllowedHosts).handler().ServeHTTP(response, publicRequest(http.MethodGet, "/api/tools", nil))
+	newAPIServer(workerURL, testOrigin, testAllowedHosts).handler().ServeHTTP(response, publicRequest(http.MethodGet, "/api/v1/engine", nil))
 
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"merge"`) {
-		t.Fatalf("unexpected tools response %d: %s", response.Code, response.Body.String())
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"name":"Prism Composable Document Engine"`) {
+		t.Fatalf("unexpected capabilities response %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -176,7 +183,7 @@ func TestGoAPIRejectsOversizedRequest(t *testing.T) {
 	defer worker.Close()
 	workerURL, _ := url.Parse(worker.URL)
 
-	request := publicRequest(http.MethodPost, "/api/process/merge", strings.NewReader("large"))
+	request := publicRequest(http.MethodPost, "/api/v1/engine/compose", strings.NewReader("large"))
 	request.ContentLength = maxRequestBytes + 1
 	request.Header.Set("Origin", testOrigin)
 	response := httptest.NewRecorder()
@@ -197,7 +204,7 @@ func TestGoAPIRequiresAllowedOriginForMutation(t *testing.T) {
 	defer worker.Close()
 	workerURL, _ := url.Parse(worker.URL)
 
-	request := publicRequest(http.MethodPost, "/api/process/merge", strings.NewReader(""))
+	request := publicRequest(http.MethodPost, "/api/v1/engine/compose", strings.NewReader(""))
 	response := httptest.NewRecorder()
 	newAPIServer(workerURL, testOrigin, testAllowedHosts).handler().ServeHTTP(response, request)
 
