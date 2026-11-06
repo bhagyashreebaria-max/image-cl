@@ -54,7 +54,26 @@ ALLOWED_HOSTS = [
     for host in (configured_hosts or "127.0.0.1,localhost,testserver").split(",")
     if host.strip()
 ]
+# Only accept platform-provided deployment names, never arbitrary *.vercel.app hosts.
+if os.environ.get("VERCEL"):
+    for key in ("VERCEL_URL", "VERCEL_BRANCH_URL", "VERCEL_PROJECT_PRODUCTION_URL"):
+        hostname = os.environ.get(key, "").strip()
+        if hostname:
+            ALLOWED_HOSTS.append(hostname)
+            ALLOWED_ORIGINS.add("https://" + hostname)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+
+@app.middleware("http")
+async def response_security(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.middleware("http")
@@ -92,6 +111,11 @@ async def limit_processing_concurrency(request, call_next):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.get("/api")
+async def api_index():
+    return {"name": "Papertrail PDF Toolkit", "routes": {"tools": "GET /api/tools", "status": "GET /api/status", "inspect": "POST /api/inspect", "process": "POST /api/process/{tool}"}, "upload_field": "files", "max_upload_bytes": MAX_UPLOAD_BYTES}
 
 
 @app.get("/api/status")
@@ -134,7 +158,7 @@ async def inspect_pdf(file: UploadFile = File(...)):
     finally:
         await file.close()
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File is larger than the 80 MiB server limit.")
+        raise HTTPException(status_code=413, detail=f"File is larger than the {MAX_UPLOAD_BYTES // 1048576} MiB upload limit.")
     try:
         return await run_in_threadpool(
             inspect_pdf_data,
@@ -199,7 +223,7 @@ async def process_pdf(
             content = await upload.read(MAX_UPLOAD_BYTES + 1)
             total_size += len(content)
             if total_size > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Combined input files exceed the 80 MiB server limit.")
+                raise HTTPException(status_code=413, detail=f"Combined input files exceed the {MAX_UPLOAD_BYTES // 1048576} MiB upload limit.")
             payloads.append((name, content))
     finally:
         for upload in files:
@@ -257,6 +281,8 @@ async def process_pdf(
         logger.exception("Unexpected error while running %s", tool)
         raise HTTPException(status_code=500, detail="Processing failed. Check the processing server logs for details.") from error
 
+    if os.environ.get("VERCEL") and len(result.data) > 4 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="The output exceeds this hosted version's 4 MiB download limit. Try fewer pages or a lower resolution, or run the local version for larger files.")
     headers = {
         "Content-Disposition": f'attachment; filename="{result.filename}"',
         "X-Input-Bytes": str(result.input_bytes),

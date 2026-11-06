@@ -6,6 +6,8 @@ const state = {
   formFields: [],
   category: "All",
   busy: false,
+  connected: false,
+  maxUploadBytes: 4 * 1024 * 1024,
   structureCount: 0,
   workflowTools: [],
   workflowOptions: {},
@@ -311,7 +313,7 @@ const elements = {
   resultIcon: document.querySelector("#result-file-icon"),
   catalogToggle: document.querySelector("#catalog-toggle"),
   catalogView: document.querySelector("#catalog-view"),
-  workbench: document.querySelector("#workbench"),
+  workbench: document.querySelector(".workbench"),
   catalogSearch: document.querySelector("#catalog-search"),
   catalogFilters: document.querySelector("#catalog-filters"),
   catalogGroups: document.querySelector("#catalog-groups"),
@@ -874,8 +876,8 @@ async function pollWatchedFolder() {
 }
 
 async function processWatchedPdf(inputName, file) {
-  if (file.size > 80 * 1024 * 1024) {
-    setNotice(`${inputName} exceeds the 80 MiB server limit and was skipped.`, "error");
+  if (file.size > state.maxUploadBytes) {
+    setNotice(`${inputName} exceeds the ${Math.floor(state.maxUploadBytes / 1048576)} MiB server limit and was skipped.`, "error");
     return;
   }
   const form = new FormData();
@@ -927,7 +929,7 @@ function processingConnectionError(error) {
 }
 
 function setTool(tool) {
-  if (!toolDetails[tool]) return;
+  if (!toolDetails[tool] || state.busy) return;
   const previousTool = state.tool;
   if (previousTool === "watch-folder" && tool !== previousTool) stopFolderWatch(true);
   state.tool = tool;
@@ -956,7 +958,7 @@ function setTool(tool) {
   elements.fileInput.multiple = details.multiple;
   elements.dropTitle.textContent = details.multiple ? "Drop files here" : "Drop a file here";
   elements.dropSubtitle.textContent = "or browse your computer";
-  elements.fileLimit.textContent = details.limit;
+  elements.fileLimit.textContent = details.limit.replace("80 MiB", `${Math.floor(state.maxUploadBytes / 1048576)} MiB`);
   elements.settingsNote.textContent = details.note;
   const browserManaged = Boolean(details.browserManaged);
   const statusTag = document.querySelector("#tool-status");
@@ -966,7 +968,7 @@ function setTool(tool) {
     ? "BROWSER WATCH"
     : details.localOnly
       ? "BROWSER ONLY"
-      : "READY TO RUN";
+      : state.connected ? "READY TO RUN" : "ENGINE OFFLINE";
   elements.privacyNote.lastChild.textContent = browserManaged
     ? "Folder access stays in this browser"
     : details.localOnly
@@ -983,7 +985,7 @@ function setTool(tool) {
       ? "Review recent processing activity saved in this browser. History never contains the PDF documents or output files."
     : details.localOnly
       ? "Manage saved workflow settings in this browser. Presets never contain your documents or outputs."
-    : "Choose a task and upload your files to the configured processing server. Get the finished copy back without managing a complicated PDF suite.";
+    : "A simpler way to merge, convert and organize your PDFs. Choose a tool, add your files, and you’re ready to go.";
   elements.introStamp.hidden = Boolean(details.localOnly);
   elements.outputColumn.hidden = Boolean(details.localOnly);
   renderOptions();
@@ -1255,8 +1257,14 @@ function updateRunButton() {
     : state.tool === "merge" || isComparison
       ? count >= 2
       : count === 1 || state.tool === "image-to-pdf" && count > 0);
-  elements.runButton.disabled = state.busy || !enoughFiles || readingOrderUnavailable;
-  elements.runLabel.textContent = state.busy
+  elements.runButton.disabled = !state.connected || state.busy || !enoughFiles || readingOrderUnavailable;
+  document.querySelector("#processing-state").hidden = !state.busy;
+  document.querySelector(".workbench").setAttribute("aria-busy", String(state.busy));
+  document.querySelectorAll("[data-tool], #catalog-toggle, #browse-tools, #add-files, .file-action, #option-fields input, #option-fields select, #option-fields textarea").forEach(control => {
+    if (state.busy) { if (control.dataset.wasDisabled === undefined) control.dataset.wasDisabled = String(control.disabled); control.disabled = true; }
+    else if (control.dataset.wasDisabled !== undefined) { control.disabled = control.dataset.wasDisabled === "true"; delete control.dataset.wasDisabled; }
+  });
+  elements.runLabel.textContent = !state.connected ? "Connecting to processing engine…" : state.busy
     ? "Working on your file…"
     : readingOrderUnavailable
       ? "Choose a PDF with page-level tags"
@@ -1276,6 +1284,7 @@ function updateRunButton() {
 }
 
 function addFiles(fileList) {
+  if (state.busy) return;
   const incoming = Array.from(fileList || []);
   if (incoming.length === 0) return;
   const details = toolDetails[state.tool];
@@ -1284,7 +1293,7 @@ function addFiles(fileList) {
     setNotice(`${details.title} uses one file at a time. The first file was added.`, "error");
   }
   const selected = details.multiple ? incoming : incoming.slice(0, 1);
-  const currentSize = state.files.reduce((sum, file) => sum + file.size, 0);
+  const currentSize = details.multiple ? state.files.reduce((sum, file) => sum + file.size, 0) : 0;
   const accepted = selected.filter((file) => {
     const extension = file.name.split(".").pop().toLowerCase();
     const valid = allowedExtensions.includes(extension);
@@ -1292,8 +1301,8 @@ function addFiles(fileList) {
     return valid;
   });
   const addedSize = accepted.reduce((sum, file) => sum + file.size, 0);
-  if (currentSize + addedSize > 80 * 1024 * 1024) {
-    setNotice("Selected files exceed the 80 MiB server limit. Remove a file and try again.", "error");
+  if (currentSize + addedSize > state.maxUploadBytes) {
+    setNotice(`Selected files exceed the ${Math.floor(state.maxUploadBytes / 1048576)} MiB upload limit. Choose smaller files.`, "error");
     return;
   }
   const combined = details.multiple ? [...state.files, ...accepted] : accepted;
@@ -1301,6 +1310,7 @@ function addFiles(fileList) {
     setNotice(`${details.title} uses exactly ${details.maxFiles} files. Remove extras and try again.`, "error");
     return;
   }
+  if (combined.length > 100) { setNotice("Choose at most 100 files per task.", "error"); return; }
   state.files = combined;
   state.pageCount = null;
   state.structureCount = 0;
@@ -1494,7 +1504,9 @@ function renderCatalog() {
 }
 
 function showCatalog(show) {
+  if (state.busy) return;
   if (show && state.tool === "watch-folder" && folderWatch.active) stopFolderWatch(false);
+  document.querySelector(".quick-tools").hidden = show;
   elements.catalogView.hidden = !show;
   elements.workbench.hidden = show;
   document.querySelector(".page-intro").hidden = show;
@@ -1509,6 +1521,11 @@ async function initialize() {
     const [statusResponse, catalogResponse] = await Promise.all([fetch("/api/status"), fetch("/api/tools")]);
     if (!statusResponse.ok || !catalogResponse.ok) throw new Error("The processing server is not responding.");
     const status = await statusResponse.json();
+    state.connected = true;
+    state.maxUploadBytes = status.max_upload_bytes;
+    elements.fileLimit.textContent = toolDetails[state.tool].limit.replace("80 MiB", `${Math.floor(state.maxUploadBytes / 1048576)} MiB`);
+    updateRunButton();
+    document.querySelector("#tool-status").lastChild.textContent = "READY TO RUN";
     state.workflowTools = status.workflow_tools;
     state.workflowOptions = status.workflow_options;
     state.catalog = await catalogResponse.json();
@@ -1521,12 +1538,15 @@ async function initialize() {
     renderCatalog();
     if (state.tool === "watch-folder" || state.tool === "history") renderOptions();
   } catch {
+    state.connected = false;
+    updateRunButton();
+    elements.runLabel.textContent = "Processing engine unavailable";
     statusLabel.textContent = "Processing server unavailable";
     setNotice("The processing server could not be reached. Check the server address and deployment status, then reload this page.", "error");
   }
 }
 
-elements.nav.addEventListener("click", (event) => {
+document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-tool]");
   if (!button) return;
   showCatalog(false);
@@ -1564,4 +1584,5 @@ window.addEventListener("beforeunload", () => {
 });
 
 setTool("merge");
+document.querySelector("#browse-tools").addEventListener("click", () => showCatalog(true));
 initialize();

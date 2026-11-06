@@ -1,5 +1,9 @@
 # Papertrail PDF Toolkit
 
+Development direction: see [ARCHITECTURE.md](ARCHITECTURE.md) for the owner's
+Go gateway + Python worker design, current implementation gaps and acceptance
+criteria. Contributor guidance is in [AGENTS.md](AGENTS.md).
+
 Papertrail is an original server-side PDF workbench. Its searchable 69-item catalog includes 65 server-side operations and four browser-only utilities across page organization, conversions, optimization, accessibility checks, annotations, comparison, document security, attachments, metadata, and workflow composition.
 
 The processing API receives uploaded documents. It reads the request into memory for processing on a worker thread, closes each upload buffer when the request finishes, and returns generated output directly in the response. The application does not create a server-side job archive or intentionally persist uploaded/output documents. The browser-only history feature stores up to 50 recent job records in local browser storage; records include tool and file names, timestamps, and sizes, but not document contents or outputs. Framework upload buffering may use temporary server storage before the endpoint reads a file. Reverse proxies, hosting platforms, backups, and infrastructure logs are outside this application's retention controls and must be configured by the operator.
@@ -91,3 +95,15 @@ python -m unittest discover -s tests -v
 ```
 
 The Go tests cover API discovery, internal worker dispatch, health/readiness, request limits, and host/origin restrictions. The Python test suite covers implemented PDF operations, API dispatch for every server-side catalog tool, API upload handling, digital signing and certification, invalid page selections, catalog status and excluded-tool discovery, browser-only tool endpoint protection, and raster workload limits.
+
+## Studio interface and hosted deployment
+
+The refreshed workspace preserves all 69 catalog tools. Shortcuts, search, workflows and local history use the existing API. Processing locks task switching and file edits until completion; upload limits are read from the server.
+
+On Windows, run `powershell -ExecutionPolicy Bypass -File .\start.ps1` from the checkout for setup and launch in one command. This invocation only changes execution policy for that PowerShell process.
+
+The Vercel deployment uses `index.py` and FastAPI directly, without spawning Go or a worker subprocess. It supports a 4 MiB combined input limit and a 4 MiB output limit, below the platform payload ceiling. Larger outputs return an actionable error; raster exports may reach this limit with small inputs. Local and container deployments retain the 80 MiB input limit. Vercel's runtime timeout also applies. This is a bounded hosted toolkit, not an unlimited large-file service.
+
+For a container host: build with `docker build -t papertrail .`, then run with `docker run --rm -p 8000:8000 -e PAPERTRAIL_ALLOWED_HOSTS=localhost,127.0.0.1 -e PAPERTRAIL_ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000 papertrail`. Configure exact HTTPS host/origin values for public hosting and apply the deployment controls documented above.
+
+Work is isolated on the `papertrail-studio` branch. The original `main` branch is unchanged. The accompanying patch can be applied on a separate branch of the original repository.

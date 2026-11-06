@@ -35,7 +35,7 @@ from pyhanko.sign.general import SigningError
 from pyhanko.sign.validation import validate_pdf_signature
 from pyhanko.sign.validation.errors import SignatureValidationError
 
-MAX_UPLOAD_BYTES = 80 * 1024 * 1024
+MAX_UPLOAD_BYTES = (4 if os.environ.get("VERCEL") else 80) * 1024 * 1024
 IMAGE_TYPES = {"png", "jpg", "jpeg", "bmp", "tif", "tiff"}
 OCR_LANGUAGES = {"eng", "hin", "eng+hin"}
 PAGE_LABEL_STYLES = {"": "No numbering", "D": "1, 2, 3", "R": "I, II, III", "r": "i, ii, iii", "A": "A, B, C", "a": "a, b, c"}
